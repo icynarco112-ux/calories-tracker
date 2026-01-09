@@ -1,0 +1,37 @@
+# Environment variables (contains secrets)
+.env
+
+# Node modules
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Build outputs
+dist/
+build/
+
+# Claude plans (local)
+.claude/

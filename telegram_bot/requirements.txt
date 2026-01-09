@@ -1,0 +1,7 @@
+aiogram>=3.3.0
+sqlalchemy>=2.0.25
+psycopg2-binary>=2.9.9
+apscheduler>=3.10.4
+python-dotenv>=1.0.0
+pytz>=2023.3
+httpx>=0.25.0

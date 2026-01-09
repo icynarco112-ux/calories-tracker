@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: calories-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mcp-server:
+    build: ./mcp_server
+    container_name: calories-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      MCP_API_KEY: ${MCP_API_KEY}
+      MCP_PORT: ${MCP_PORT}
+      TZ: ${TZ}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  telegram-bot:
+    build: ./telegram_bot
+    container_name: calories-telegram-bot
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TZ: ${TZ}
+      DAILY_REPORT_HOUR: ${DAILY_REPORT_HOUR}
+      DAILY_REPORT_MINUTE: ${DAILY_REPORT_MINUTE}
+      WEEKLY_REPORT_DAY: ${WEEKLY_REPORT_DAY}
+      WEEKLY_REPORT_HOUR: ${WEEKLY_REPORT_HOUR}
+      MONTHLY_REPORT_DAY: ${MONTHLY_REPORT_DAY}
+      MONTHLY_REPORT_HOUR: ${MONTHLY_REPORT_HOUR}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # cloudflared будет запущен отдельно после настройки туннеля
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: calories-cloudflared
+  #   restart: unless-stopped
+  #   command: tunnel run
+  #   environment:
+  #     TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+  #   depends_on:
+  #     - mcp-server
+
+volumes:
+  postgres_data:

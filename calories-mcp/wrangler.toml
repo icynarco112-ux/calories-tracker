@@ -1,0 +1,20 @@
+name = "calories-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-01-03"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "calories-tracker-db"
+database_id = "d89913e3-d0cc-4bb7-8165-303a26fdf483"
+
+# Durable Objects for MCP
+[[durable_objects.bindings]]
+name = "MCP_OBJECT"
+class_name = "CaloriesMCP"
+
+# Migrations for Durable Objects
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CaloriesMCP"]

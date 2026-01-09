@@ -1,0 +1,23 @@
+{
+  "name": "calories-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute calories-tracker-db --local --file=./src/schema.sql",
+    "db:init:remote": "wrangler d1 execute calories-tracker-db --remote --file=./src/schema.sql"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.0.7",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "agents": "^0.0.92",
+    "hono": "^4.7.10",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250525.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.19.1"
+  }
+}

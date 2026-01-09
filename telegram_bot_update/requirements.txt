@@ -1,0 +1,4 @@
+aiogram>=3.0.0
+apscheduler>=3.10.0
+pytz>=2023.3
+httpx>=0.25.0
