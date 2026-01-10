@@ -262,13 +262,17 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
 
   // Helper to get userId - checks props first, then storage
   private async getUserId(): Promise<number | null> {
+    console.log("[MCP] getUserId() called");
+
     // 1. Try to get from props (passed from fetch handler)
     const props = this.props as { userCode?: string } | undefined;
     let userCode = props?.userCode || null;
+    console.log(`[MCP] userCode from props: ${userCode}`);
 
     // 2. If not in props, try storage (for subsequent tool calls)
     if (!userCode) {
       userCode = await this.ctx.storage.get("userCode") as string | null;
+      console.log(`[MCP] userCode from storage: ${userCode}`);
     }
 
     // 3. If we have a code, save to storage for future calls
@@ -277,26 +281,33 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
     }
 
     if (!userCode) {
+      console.error("[MCP] No userCode found in props or storage");
       return null;
     }
 
-    return await getUserIdByCode(this.env.DB, userCode);
+    const userId = await getUserIdByCode(this.env.DB, userCode);
+    console.log(`[MCP] userId for code ${userCode}: ${userId}`);
+    return userId;
   }
 
   async init() {
     // Store user code from props (passed from fetch handler via ctx.props)
     const props = this.props as { userCode?: string } | undefined;
+    console.log(`[MCP] init() called, props.userCode: ${props?.userCode}`);
     if (props?.userCode) {
       await this.ctx.storage.put("userCode", props.userCode);
+      console.log(`[MCP] Saved userCode to storage: ${props.userCode}`);
     }
 
     // Tool: add_meal
+    // Support both standard names and ChatGPT's alternative names
     this.server.tool(
       "add_meal",
       "Add a new meal to the calories tracker. Use this when the user sends food photos or describes what they ate.",
       {
-        meal_name: z.string().describe("Name of the meal or dish"),
-        calories: z.number().describe("Estimated calories (kcal)"),
+        // Standard names
+        meal_name: z.string().optional().describe("Name of the meal or dish"),
+        calories: z.number().optional().describe("Estimated calories (kcal)"),
         proteins: z.number().optional().describe("Protein content in grams"),
         fats: z.number().optional().describe("Fat content in grams"),
         carbs: z.number().optional().describe("Carbohydrate content in grams"),
@@ -313,12 +324,44 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
           .optional()
           .describe("Health score from 1 (unhealthy) to 10 (very healthy)"),
         notes: z.string().optional().describe("Additional notes about the meal"),
+        // ChatGPT alternative names
+        name: z.string().optional().describe("Alternative: Name of the meal"),
+        calories_kcal: z.number().optional().describe("Alternative: Calories in kcal"),
+        protein_g: z.number().optional().describe("Alternative: Protein in grams"),
+        fat_g: z.number().optional().describe("Alternative: Fat in grams"),
+        carbs_g: z.number().optional().describe("Alternative: Carbs in grams"),
+        fiber_g: z.number().optional().describe("Alternative: Fiber in grams"),
+        health_score: z.number().optional().describe("Alternative: Health score 1-10"),
       },
-      async (args) => {
+      async (rawArgs) => {
+        // Normalize arguments: support both standard and ChatGPT alternative names
+        const args = {
+          meal_name: rawArgs.meal_name || rawArgs.name || "Unknown meal",
+          calories: rawArgs.calories || rawArgs.calories_kcal || 0,
+          proteins: rawArgs.proteins || rawArgs.protein_g,
+          fats: rawArgs.fats || rawArgs.fat_g,
+          carbs: rawArgs.carbs || rawArgs.carbs_g,
+          fiber: rawArgs.fiber || rawArgs.fiber_g,
+          water_ml: rawArgs.water_ml,
+          meal_type: rawArgs.meal_type,
+          healthiness_score: rawArgs.healthiness_score || rawArgs.health_score,
+          notes: rawArgs.notes,
+        };
+        console.log(`[MCP] add_meal called: ${args.meal_name}, ${args.calories} kcal (raw: ${JSON.stringify(rawArgs)})`);
         const userId = await this.getUserId();
         if (!userId) {
+          const props = this.props as { userCode?: string } | undefined;
+          const userCode = props?.userCode || await this.ctx.storage.get("userCode");
+          console.error(`[MCP] add_meal failed: user not found for code ${userCode}`);
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated. Please register via Telegram bot." }) }],
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "User not authenticated",
+                hint: "Please register via Telegram bot first using /register command",
+                userCode: userCode || "not provided"
+              })
+            }],
           };
         }
 
@@ -1025,6 +1068,382 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
         };
       }
     );
+
+    // Tool: delete_meal
+    this.server.tool(
+      "delete_meal",
+      "Delete a meal from the tracker. Use when user wants to remove a recorded meal.",
+      {
+        meal_id: z.number().describe("ID of the meal to delete"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+          };
+        }
+
+        // Check if meal exists and belongs to user
+        const meal = await this.env.DB.prepare(
+          "SELECT id, meal_name FROM meals WHERE id = ? AND user_id = ?"
+        ).bind(args.meal_id, userId).first();
+
+        if (!meal) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: "Meal not found or doesn't belong to you", meal_id: args.meal_id }),
+            }],
+          };
+        }
+
+        await this.env.DB.prepare("DELETE FROM meals WHERE id = ? AND user_id = ?")
+          .bind(args.meal_id, userId).run();
+
+        // Invalidate daily AI analysis cache
+        await invalidateDailyInsight(this.env.DB, userId);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              message: `Meal "${meal.meal_name}" deleted`,
+              deleted_id: args.meal_id,
+            }),
+          }],
+        };
+      }
+    );
+
+    // Tool: edit_meal
+    this.server.tool(
+      "edit_meal",
+      "Edit an existing meal. Use when user wants to correct calories, name, or other details of a recorded meal.",
+      {
+        meal_id: z.number().describe("ID of the meal to edit"),
+        meal_name: z.string().optional().describe("New name for the meal"),
+        calories: z.number().optional().describe("New calorie value"),
+        proteins: z.number().optional().describe("New protein value in grams"),
+        fats: z.number().optional().describe("New fat value in grams"),
+        carbs: z.number().optional().describe("New carbs value in grams"),
+        fiber: z.number().optional().describe("New fiber value in grams"),
+        meal_type: z.enum(["breakfast", "lunch", "dinner", "snack", "other"]).optional().describe("New meal type"),
+        healthiness_score: z.number().min(1).max(10).optional().describe("New health score 1-10"),
+        notes: z.string().optional().describe("New notes"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+          };
+        }
+
+        // Check if meal exists and belongs to user
+        const meal = await this.env.DB.prepare(
+          "SELECT * FROM meals WHERE id = ? AND user_id = ?"
+        ).bind(args.meal_id, userId).first();
+
+        if (!meal) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: "Meal not found or doesn't belong to you", meal_id: args.meal_id }),
+            }],
+          };
+        }
+
+        // Build update query dynamically
+        const updates: string[] = [];
+        const values: unknown[] = [];
+
+        if (args.meal_name !== undefined) { updates.push("meal_name = ?"); values.push(args.meal_name); }
+        if (args.calories !== undefined) { updates.push("calories = ?"); values.push(args.calories); }
+        if (args.proteins !== undefined) { updates.push("proteins = ?"); values.push(args.proteins); }
+        if (args.fats !== undefined) { updates.push("fats = ?"); values.push(args.fats); }
+        if (args.carbs !== undefined) { updates.push("carbs = ?"); values.push(args.carbs); }
+        if (args.fiber !== undefined) { updates.push("fiber = ?"); values.push(args.fiber); }
+        if (args.meal_type !== undefined) { updates.push("meal_type = ?"); values.push(args.meal_type); }
+        if (args.healthiness_score !== undefined) { updates.push("healthiness_score = ?"); values.push(args.healthiness_score); }
+        if (args.notes !== undefined) { updates.push("notes = ?"); values.push(args.notes); }
+
+        if (updates.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: "No fields to update provided" }),
+            }],
+          };
+        }
+
+        values.push(args.meal_id, userId);
+        await this.env.DB.prepare(
+          `UPDATE meals SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`
+        ).bind(...values).run();
+
+        // Invalidate daily AI analysis cache
+        await invalidateDailyInsight(this.env.DB, userId);
+
+        // Get updated meal
+        const updated = await this.env.DB.prepare(
+          "SELECT * FROM meals WHERE id = ?"
+        ).bind(args.meal_id).first();
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              message: "Meal updated successfully",
+              meal: updated,
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Tool: get_activity_history
+    this.server.tool(
+      "get_activity_history",
+      "Get activity/exercise history. Use to show past workouts and exercises.",
+      {
+        limit: z.number().optional().describe("Number of records to return (default: 10)"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const limit = args.limit ?? 10;
+        const activities = await this.env.DB.prepare(
+          `SELECT id, activity_type, duration_minutes, intensity, calories_burned, description, notes,
+                  datetime(created_at, '+2 hours') as created_at
+           FROM activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
+        ).bind(userId, limit).all();
+
+        const activityNames: Record<string, string> = { walking: 'Ходьба', running: 'Бег', cycling: 'Велосипед', gym: 'Тренажёрный зал', swimming: 'Плавание', yoga: 'Йога', other: 'Активность' };
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              count: activities.results.length,
+              activities: activities.results.map(a => ({ ...a, activity_name: activityNames[(a as Record<string, unknown>).activity_type as string] || 'Активность' })),
+            }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Tool: delete_activity
+    this.server.tool(
+      "delete_activity",
+      "Delete an activity/exercise record. Use when user wants to remove a recorded workout.",
+      {
+        activity_id: z.number().describe("ID of the activity to delete"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const activity = await this.env.DB.prepare(
+          "SELECT id, activity_type, duration_minutes FROM activities WHERE id = ? AND user_id = ?"
+        ).bind(args.activity_id, userId).first();
+
+        if (!activity) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Activity not found", activity_id: args.activity_id }) }] };
+        }
+
+        await this.env.DB.prepare("DELETE FROM activities WHERE id = ? AND user_id = ?").bind(args.activity_id, userId).run();
+        await invalidateDailyInsight(this.env.DB, userId);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, message: `Activity deleted`, deleted_id: args.activity_id }),
+          }],
+        };
+      }
+    );
+
+    // Tool: edit_activity
+    this.server.tool(
+      "edit_activity",
+      "Edit an existing activity/exercise. Use when user wants to correct duration, calories, or other details.",
+      {
+        activity_id: z.number().describe("ID of the activity to edit"),
+        activity_type: z.enum(["walking", "running", "cycling", "gym", "swimming", "yoga", "other"]).optional(),
+        duration_minutes: z.number().optional().describe("New duration in minutes"),
+        intensity: z.enum(["light", "moderate", "vigorous"]).optional(),
+        calories_burned: z.number().optional().describe("New calories burned"),
+        description: z.string().optional(),
+        notes: z.string().optional(),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const activity = await this.env.DB.prepare(
+          "SELECT * FROM activities WHERE id = ? AND user_id = ?"
+        ).bind(args.activity_id, userId).first();
+
+        if (!activity) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Activity not found", activity_id: args.activity_id }) }] };
+        }
+
+        const updates: string[] = [];
+        const values: unknown[] = [];
+        if (args.activity_type !== undefined) { updates.push("activity_type = ?"); values.push(args.activity_type); }
+        if (args.duration_minutes !== undefined) { updates.push("duration_minutes = ?"); values.push(args.duration_minutes); }
+        if (args.intensity !== undefined) { updates.push("intensity = ?"); values.push(args.intensity); }
+        if (args.calories_burned !== undefined) { updates.push("calories_burned = ?"); values.push(args.calories_burned); }
+        if (args.description !== undefined) { updates.push("description = ?"); values.push(args.description); }
+        if (args.notes !== undefined) { updates.push("notes = ?"); values.push(args.notes); }
+
+        if (updates.length === 0) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "No fields to update" }) }] };
+        }
+
+        values.push(args.activity_id, userId);
+        await this.env.DB.prepare(`UPDATE activities SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`).bind(...values).run();
+        await invalidateDailyInsight(this.env.DB, userId);
+
+        const updated = await this.env.DB.prepare("SELECT * FROM activities WHERE id = ?").bind(args.activity_id).first();
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, message: "Activity updated", activity: updated }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Tool: search_meals
+    this.server.tool(
+      "search_meals",
+      "Search meals in history by name. Use when user asks about specific food they ate before.",
+      {
+        query: z.string().describe("Search term to find in meal names"),
+        limit: z.number().optional().describe("Max results (default: 10)"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const limit = args.limit ?? 10;
+        const meals = await this.env.DB.prepare(
+          `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, created_at
+           FROM meals WHERE user_id = ? AND meal_name LIKE ? ORDER BY created_at DESC LIMIT ?`
+        ).bind(userId, `%${args.query}%`, limit).all();
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ query: args.query, count: meals.results.length, meals: meals.results }, null, 2),
+          }],
+        };
+      }
+    );
+
+    // Tool: delete_weight
+    this.server.tool(
+      "delete_weight",
+      "Delete a weight record. Use when user wants to remove an incorrect weight entry.",
+      {
+        weight_id: z.number().describe("ID of the weight record to delete"),
+      },
+      async (args) => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const record = await this.env.DB.prepare(
+          "SELECT id, weight FROM weight_history WHERE id = ? AND user_id = ?"
+        ).bind(args.weight_id, userId).first();
+
+        if (!record) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Weight record not found", weight_id: args.weight_id }) }] };
+        }
+
+        await this.env.DB.prepare("DELETE FROM weight_history WHERE id = ? AND user_id = ?").bind(args.weight_id, userId).run();
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, message: `Weight record ${record.weight}kg deleted`, deleted_id: args.weight_id }),
+          }],
+        };
+      }
+    );
+
+    // Tool: get_recommendations
+    this.server.tool(
+      "get_recommendations",
+      "Get food recommendations based on remaining calories and macros for today. Use to suggest what user can still eat.",
+      {},
+      async () => {
+        const userId = await this.getUserId();
+        if (!userId) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }] };
+        }
+
+        const profile = await this.env.DB.prepare(
+          "SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?"
+        ).bind(userId).first();
+
+        if (!profile) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Profile not set up. Use set_user_profile first." }) }] };
+        }
+
+        const today = await this.env.DB.prepare(
+          `SELECT COALESCE(SUM(calories), 0) as calories, COALESCE(SUM(proteins), 0) as proteins,
+                  COALESCE(SUM(fats), 0) as fats, COALESCE(SUM(carbs), 0) as carbs
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+        ).bind(userId).first();
+
+        const calorieGoal = profile.daily_calorie_goal as number;
+        const proteinGoal = profile.protein_goal as number;
+        const caloriesEaten = (today?.calories || 0) as number;
+        const proteinEaten = (today?.proteins || 0) as number;
+        const caloriesLeft = calorieGoal - caloriesEaten;
+        const proteinLeft = proteinGoal - proteinEaten;
+
+        let recommendations: string[] = [];
+        if (caloriesLeft <= 0) {
+          recommendations.push("Дневной лимит калорий достигнут. Рекомендуется не есть больше или выбрать очень лёгкие продукты.");
+        } else if (caloriesLeft < 200) {
+          recommendations.push(`Осталось мало калорий (${caloriesLeft} ккал). Подойдут: овощной салат, огурцы, зелёный чай.`);
+        } else if (proteinLeft > 20) {
+          recommendations.push(`Нужно добрать белок (${Math.round(proteinLeft)}г). Подойдут: куриная грудка, творог, яйца, рыба.`);
+        } else if (caloriesLeft > 500) {
+          recommendations.push(`Ещё можно съесть полноценный приём пищи (~${caloriesLeft} ккал).`);
+        } else {
+          recommendations.push(`Осталось ${caloriesLeft} ккал. Подойдёт лёгкий перекус или небольшой ужин.`);
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              remaining: { calories: caloriesLeft, protein: Math.round(proteinLeft) },
+              eaten_today: { calories: caloriesEaten, protein: Math.round(proteinEaten) },
+              goals: { calories: calorieGoal, protein: proteinGoal },
+              recommendations,
+            }, null, 2),
+          }],
+        };
+      }
+    );
   }
 }
 
@@ -1049,7 +1468,7 @@ export default {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
           "Access-Control-Allow-Headers": "*",
         },
       });
@@ -1065,9 +1484,848 @@ export default {
       return jsonResponse({
         name: "Calories Tracker MCP Server",
         version: "2.0.0",
-        mcp_endpoint: "/sse?code=YOUR_CODE",
-        api_endpoints: ["/api/register", "/api/user", "/api/today", "/api/week", "/api/month"],
+        personal_url: "/user/{YOUR_CODE}/...",
+        mcp_endpoint: "/user/{YOUR_CODE}/sse",
+        chatgpt_schema: "/user/{YOUR_CODE}/openapi.json",
+        api_endpoints: ["/api/register", "/api/user", "/api/today"],
       });
+    }
+
+    // ============ PERSONAL USER ENDPOINTS ============
+    // /user/{code}/... - персональные URL для каждого пользователя
+    const userPathMatch = url.pathname.match(/^\/user\/([A-Za-z0-9]+)(\/.*)?$/);
+    if (userPathMatch) {
+      const userCode = userPathMatch[1];
+      const subPath = userPathMatch[2] || '/';
+
+      // Проверить что пользователь существует
+      const userId = await getUserIdByCode(env.DB, userCode);
+
+      // Персональная OpenAPI схема (доступна без проверки userId для discovery)
+      if (subPath === '/openapi.json') {
+        const baseUrl = `https://calories-mcp.icynarco112.workers.dev/user/${userCode}`;
+        const openApiSchema = {
+          openapi: "3.1.0",
+          info: {
+            title: "Calories Tracker - Personal API",
+            description: `Personal API for user ${userCode}. Track meals and nutrition.`,
+            version: "1.0.0"
+          },
+          servers: [{ url: baseUrl, description: "Personal endpoint" }],
+          paths: {
+            "/api/meals": {
+              post: {
+                operationId: "addMeal",
+                summary: "Add a meal to the tracker",
+                description: "Record a meal with nutritional information. Use when user wants to log food they ate.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["name", "calories_kcal"],
+                        properties: {
+                          name: { type: "string", description: "Name of the meal" },
+                          calories_kcal: { type: "integer", description: "Calories in kcal" },
+                          protein_g: { type: "number", description: "Protein in grams" },
+                          fat_g: { type: "number", description: "Fat in grams" },
+                          carbs_g: { type: "number", description: "Carbs in grams" },
+                          fiber_g: { type: "number", description: "Fiber in grams" },
+                          meal_type: { type: "string", enum: ["breakfast", "lunch", "dinner", "snack", "other"] },
+                          health_score: { type: "integer", minimum: 1, maximum: 10 }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Meal added successfully" } }
+              },
+              get: {
+                operationId: "getMealHistory",
+                summary: "Get meal history",
+                description: "Get recent meals logged by the user.",
+                parameters: [{ name: "limit", in: "query", schema: { type: "integer", default: 10 }, description: "Number of meals to return" }],
+                responses: { "200": { description: "List of meals" } }
+              }
+            },
+            "/api/water": {
+              post: {
+                operationId: "addWater",
+                summary: "Record water intake",
+                description: "Record drinking water, tea, coffee, or other beverages.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["amount_ml"],
+                        properties: {
+                          amount_ml: { type: "integer", description: "Amount in milliliters" },
+                          beverage_type: { type: "string", enum: ["water", "tea", "coffee", "juice", "other"], description: "Type of beverage" },
+                          notes: { type: "string", description: "Optional notes" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Water intake recorded" } }
+              }
+            },
+            "/api/activity": {
+              post: {
+                operationId: "addActivity",
+                summary: "Record physical activity",
+                description: "Record exercise or physical activity like walking, running, gym, etc.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["activity_type", "duration_minutes"],
+                        properties: {
+                          activity_type: { type: "string", enum: ["walking", "running", "cycling", "gym", "swimming", "yoga", "other"], description: "Type of activity" },
+                          duration_minutes: { type: "integer", description: "Duration in minutes" },
+                          intensity: { type: "string", enum: ["light", "moderate", "vigorous"], description: "Intensity level" },
+                          calories_burned: { type: "integer", description: "Calories burned (optional, will be calculated if not provided)" },
+                          notes: { type: "string", description: "Optional notes" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Activity recorded" } }
+              },
+              get: {
+                operationId: "getActivityHistory",
+                summary: "Get activity history",
+                description: "Get recent physical activities and exercises.",
+                parameters: [{ name: "limit", in: "query", schema: { type: "integer", default: 10 }, description: "Number of records" }],
+                responses: { "200": { description: "Activity history" } }
+              }
+            },
+            "/api/today": {
+              get: {
+                operationId: "getTodaySummary",
+                summary: "Get today's nutrition summary",
+                description: "Get all meals logged today with totals and remaining goals.",
+                responses: { "200": { description: "Today's summary with meals and totals" } }
+              }
+            },
+            "/api/weekly": {
+              get: {
+                operationId: "getWeeklySummary",
+                summary: "Get weekly nutrition summary",
+                description: "Get nutrition statistics for the last 7 days with daily breakdown.",
+                responses: { "200": { description: "Weekly summary" } }
+              }
+            },
+            "/api/monthly": {
+              get: {
+                operationId: "getMonthlySummary",
+                summary: "Get monthly nutrition summary",
+                description: "Get nutrition statistics for the current month.",
+                responses: { "200": { description: "Monthly summary" } }
+              }
+            },
+            "/api/profile": {
+              get: {
+                operationId: "getUserProfile",
+                summary: "Get user profile and goals",
+                description: "Get physical parameters, BMR, TDEE, and nutrition goals.",
+                responses: { "200": { description: "User profile" } }
+              },
+              put: {
+                operationId: "setUserProfile",
+                summary: "Set or update user profile",
+                description: "Set physical parameters and goals. This calculates BMR, TDEE, and daily calorie targets.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["height_cm", "current_weight", "target_weight", "birth_date", "gender", "activity_level"],
+                        properties: {
+                          height_cm: { type: "number", description: "Height in centimeters" },
+                          current_weight: { type: "number", description: "Current weight in kg" },
+                          target_weight: { type: "number", description: "Target weight in kg" },
+                          birth_date: { type: "string", description: "Birth date in YYYY-MM-DD format" },
+                          gender: { type: "string", enum: ["male", "female"], description: "Gender for BMR calculation" },
+                          activity_level: { type: "string", enum: ["sedentary", "light", "moderate", "active", "very_active"], description: "Activity level" },
+                          goal_type: { type: "string", enum: ["lose_weight", "gain_weight", "maintain"], description: "Weight goal" },
+                          weight_change_rate: { type: "string", enum: ["slow", "moderate", "fast"], description: "Rate of weight change" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Profile saved" } }
+              }
+            },
+            "/api/weight": {
+              post: {
+                operationId: "logWeight",
+                summary: "Record current weight",
+                description: "Log current weight for tracking progress over time.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["weight"],
+                        properties: {
+                          weight: { type: "number", description: "Current weight in kg" },
+                          notes: { type: "string", description: "Optional notes about the measurement" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Weight recorded" } }
+              },
+              get: {
+                operationId: "getWeightHistory",
+                summary: "Get weight history",
+                description: "Get weight tracking history to see progress over time.",
+                parameters: [{ name: "limit", in: "query", schema: { type: "integer", default: 30 }, description: "Number of records to return" }],
+                responses: { "200": { description: "Weight history with stats" } }
+              }
+            },
+            "/api/meals/{meal_id}": {
+              delete: {
+                operationId: "deleteMeal",
+                summary: "Delete a meal",
+                description: "Delete a recorded meal by its ID. Use when user wants to remove an entry.",
+                parameters: [{ name: "meal_id", in: "path", required: true, schema: { type: "integer" }, description: "ID of the meal to delete" }],
+                responses: { "200": { description: "Meal deleted" }, "404": { description: "Meal not found" } }
+              },
+              patch: {
+                operationId: "editMeal",
+                summary: "Edit a meal",
+                description: "Edit/update a recorded meal. Use when user wants to correct calories, name, or other details.",
+                parameters: [{ name: "meal_id", in: "path", required: true, schema: { type: "integer" }, description: "ID of the meal to edit" }],
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          name: { type: "string", description: "New name for the meal" },
+                          calories_kcal: { type: "integer", description: "New calorie value" },
+                          protein_g: { type: "number", description: "New protein value" },
+                          fat_g: { type: "number", description: "New fat value" },
+                          carbs_g: { type: "number", description: "New carbs value" },
+                          meal_type: { type: "string", enum: ["breakfast", "lunch", "dinner", "snack", "other"] },
+                          health_score: { type: "integer", minimum: 1, maximum: 10 },
+                          notes: { type: "string", description: "New notes" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Meal updated" }, "404": { description: "Meal not found" } }
+              }
+            },
+            "/api/meals/search": {
+              get: {
+                operationId: "searchMeals",
+                summary: "Search meals by name",
+                description: "Search through meal history by name. Use when user asks about specific food they ate before.",
+                parameters: [
+                  { name: "q", in: "query", required: true, schema: { type: "string" }, description: "Search query" },
+                  { name: "limit", in: "query", schema: { type: "integer", default: 20 }, description: "Max results" }
+                ],
+                responses: { "200": { description: "Search results" } }
+              }
+            },
+            "/api/activity/{activity_id}": {
+              delete: {
+                operationId: "deleteActivity",
+                summary: "Delete an activity",
+                description: "Delete a recorded activity/exercise by its ID.",
+                parameters: [{ name: "activity_id", in: "path", required: true, schema: { type: "integer" }, description: "ID of the activity" }],
+                responses: { "200": { description: "Activity deleted" }, "404": { description: "Activity not found" } }
+              },
+              patch: {
+                operationId: "editActivity",
+                summary: "Edit an activity",
+                description: "Edit/update a recorded activity. Use when user wants to correct duration, calories, or type.",
+                parameters: [{ name: "activity_id", in: "path", required: true, schema: { type: "integer" }, description: "ID of the activity" }],
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          activity_type: { type: "string", enum: ["walking", "running", "cycling", "gym", "swimming", "yoga", "other"] },
+                          duration_minutes: { type: "integer" },
+                          intensity: { type: "string", enum: ["light", "moderate", "vigorous"] },
+                          calories_burned: { type: "integer" },
+                          notes: { type: "string" }
+                        }
+                      }
+                    }
+                  }
+                },
+                responses: { "200": { description: "Activity updated" }, "404": { description: "Activity not found" } }
+              }
+            },
+            "/api/weight/{weight_id}": {
+              delete: {
+                operationId: "deleteWeight",
+                summary: "Delete a weight record",
+                description: "Delete an incorrect weight entry by its ID.",
+                parameters: [{ name: "weight_id", in: "path", required: true, schema: { type: "integer" }, description: "ID of the weight record" }],
+                responses: { "200": { description: "Weight record deleted" }, "404": { description: "Record not found" } }
+              }
+            },
+            "/api/recommendations": {
+              get: {
+                operationId: "getRecommendations",
+                summary: "Get food recommendations",
+                description: "Get personalized food recommendations based on remaining calories and macros for today.",
+                responses: { "200": { description: "Recommendations with remaining goals" } }
+              }
+            }
+          }
+        };
+        return new Response(JSON.stringify(openApiSchema, null, 2), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+
+      // Для остальных endpoints нужен валидный пользователь
+      if (!userId) {
+        return jsonResponse({ error: "Invalid user code", code: userCode }, 404);
+      }
+
+      // POST /user/{code}/api/meals - добавить еду
+      if (subPath === '/api/meals' && request.method === 'POST') {
+        try {
+          const body = await request.json() as Record<string, unknown>;
+          const mealName = (body.meal_name || body.name || "Unknown meal") as string;
+          const calories = (body.calories || body.calories_kcal || 0) as number;
+          const proteins = (body.proteins || body.protein_g || 0) as number;
+          const fats = (body.fats || body.fat_g || 0) as number;
+          const carbs = (body.carbs || body.carbs_g || 0) as number;
+          const fiber = (body.fiber || body.fiber_g || 0) as number;
+          const waterMl = (body.water_ml || 0) as number;
+          const mealType = (body.meal_type || "other") as string;
+          const healthScore = (body.healthiness_score || body.health_score || 5) as number;
+          const notes = (body.notes || null) as string | null;
+
+          const result = await env.DB.prepare(
+            `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).bind(userId, mealName, calories, proteins, fats, carbs, fiber, waterMl, mealType, healthScore, notes).run();
+
+          return jsonResponse({
+            success: true,
+            message: `Meal "${mealName}" added!`,
+            id: result.meta.last_row_id,
+            calories, proteins, fats, carbs
+          });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to add meal", details: String(error) }, 500);
+        }
+      }
+
+      // GET /user/{code}/api/today - статистика за сегодня
+      if (subPath === '/api/today' && request.method === 'GET') {
+        const meals = await env.DB.prepare(
+          `SELECT meal_name, calories, proteins, fats, carbs, fiber, meal_type, healthiness_score, created_at
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
+           ORDER BY created_at DESC`
+        ).bind(userId).all();
+
+        const totals = await env.DB.prepare(
+          `SELECT SUM(calories) as total_calories, SUM(proteins) as total_proteins,
+                  SUM(fats) as total_fats, SUM(carbs) as total_carbs, COUNT(*) as meal_count
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+        ).bind(userId).first();
+
+        const profile = await env.DB.prepare(
+          `SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?`
+        ).bind(userId).first();
+
+        const calorieGoal = (profile?.daily_calorie_goal || 2000) as number;
+        const proteinGoal = (profile?.protein_goal || 100) as number;
+        const totalCalories = (totals?.total_calories || 0) as number;
+
+        return jsonResponse({
+          date: new Date().toISOString().split('T')[0],
+          meals: meals.results,
+          totals: {
+            calories: totalCalories,
+            proteins: totals?.total_proteins || 0,
+            fats: totals?.total_fats || 0,
+            carbs: totals?.total_carbs || 0,
+            meal_count: totals?.meal_count || 0
+          },
+          goals: {
+            calorie_goal: calorieGoal,
+            protein_goal: proteinGoal,
+            calories_remaining: calorieGoal - totalCalories
+          }
+        });
+      }
+
+      // GET /user/{code}/api/profile - профиль пользователя
+      if (subPath === '/api/profile' && request.method === 'GET') {
+        const profile = await env.DB.prepare(
+          `SELECT * FROM user_profiles WHERE user_id = ?`
+        ).bind(userId).first();
+
+        if (!profile) {
+          return jsonResponse({ error: "Profile not set up" }, 404);
+        }
+
+        return jsonResponse({
+          height_cm: profile.height_cm,
+          current_weight: profile.current_weight,
+          target_weight: profile.target_weight,
+          goal_type: profile.goal_type,
+          activity_level: profile.activity_level,
+          bmr: profile.bmr,
+          tdee: profile.tdee,
+          daily_calorie_goal: profile.daily_calorie_goal,
+          protein_goal: profile.protein_goal
+        });
+      }
+
+      // PUT /user/{code}/api/profile - настроить профиль
+      if (subPath === '/api/profile' && request.method === 'PUT') {
+        try {
+          const body = await request.json() as Record<string, unknown>;
+          const heightCm = body.height_cm as number;
+          const currentWeight = body.current_weight as number;
+          const targetWeight = body.target_weight as number;
+          const birthDate = body.birth_date as string;
+          const gender = body.gender as string;
+          const activityLevel = body.activity_level as string;
+          const goalType = (body.goal_type || 'lose_weight') as string;
+          const weightChangeRate = (body.weight_change_rate || 'moderate') as string;
+
+          const age = calculateAge(birthDate);
+          const bmr = calculateBMR(currentWeight, heightCm, age, gender as 'male' | 'female');
+          const tdee = calculateTDEE(bmr, activityLevel as 'sedentary' | 'light' | 'moderate' | 'active' | 'very_active');
+          const dailyGoal = calculateDailyGoal(tdee, weightChangeRate as 'slow' | 'moderate' | 'fast', goalType as 'lose_weight' | 'gain_weight' | 'maintain');
+          const proteinGoal = calculateProteinGoal(targetWeight);
+
+          await env.DB.prepare(
+            `INSERT INTO user_profiles (user_id, height_cm, current_weight, target_weight, birth_date, gender, activity_level, bmr, tdee, daily_calorie_goal, protein_goal, weight_loss_rate, goal_type, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(user_id) DO UPDATE SET
+               height_cm = excluded.height_cm, current_weight = excluded.current_weight, target_weight = excluded.target_weight,
+               birth_date = excluded.birth_date, gender = excluded.gender, activity_level = excluded.activity_level,
+               bmr = excluded.bmr, tdee = excluded.tdee, daily_calorie_goal = excluded.daily_calorie_goal,
+               protein_goal = excluded.protein_goal, weight_loss_rate = excluded.weight_loss_rate, goal_type = excluded.goal_type, updated_at = datetime('now')`
+          ).bind(userId, heightCm, currentWeight, targetWeight, birthDate, gender, activityLevel, bmr, tdee, dailyGoal, proteinGoal, weightChangeRate, goalType).run();
+
+          return jsonResponse({
+            success: true,
+            message: "Profile saved!",
+            profile: { height_cm: heightCm, current_weight: currentWeight, target_weight: targetWeight, age, bmr, tdee, daily_calorie_goal: dailyGoal, protein_goal: proteinGoal }
+          });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to save profile", details: String(error) }, 500);
+        }
+      }
+
+      // GET /user/{code}/api/meals - история еды
+      if (subPath === '/api/meals' && request.method === 'GET') {
+        const limit = parseInt(url.searchParams.get('limit') || '10');
+        const meals = await env.DB.prepare(
+          `SELECT id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes, created_at
+           FROM meals WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
+        ).bind(userId, limit).all();
+
+        return jsonResponse({ count: meals.results.length, meals: meals.results });
+      }
+
+      // DELETE /user/{code}/api/meals/{id} - удалить еду
+      const deleteMatch = subPath.match(/^\/api\/meals\/(\d+)$/);
+      if (deleteMatch && request.method === 'DELETE') {
+        const mealId = parseInt(deleteMatch[1]);
+        const meal = await env.DB.prepare(
+          "SELECT id, meal_name FROM meals WHERE id = ? AND user_id = ?"
+        ).bind(mealId, userId).first();
+
+        if (!meal) {
+          return jsonResponse({ error: "Meal not found", meal_id: mealId }, 404);
+        }
+
+        await env.DB.prepare("DELETE FROM meals WHERE id = ? AND user_id = ?").bind(mealId, userId).run();
+        return jsonResponse({ success: true, message: `Meal "${meal.meal_name}" deleted`, deleted_id: mealId });
+      }
+
+      // PATCH /user/{code}/api/meals/{id} - редактировать еду
+      const patchMatch = subPath.match(/^\/api\/meals\/(\d+)$/);
+      if (patchMatch && request.method === 'PATCH') {
+        try {
+          const mealId = parseInt(patchMatch[1]);
+          const meal = await env.DB.prepare(
+            "SELECT * FROM meals WHERE id = ? AND user_id = ?"
+          ).bind(mealId, userId).first();
+
+          if (!meal) {
+            return jsonResponse({ error: "Meal not found", meal_id: mealId }, 404);
+          }
+
+          const body = await request.json() as Record<string, unknown>;
+          const updates: string[] = [];
+          const values: unknown[] = [];
+
+          if (body.name !== undefined || body.meal_name !== undefined) {
+            updates.push("meal_name = ?"); values.push(body.name || body.meal_name);
+          }
+          if (body.calories !== undefined || body.calories_kcal !== undefined) {
+            updates.push("calories = ?"); values.push(body.calories || body.calories_kcal);
+          }
+          if (body.proteins !== undefined || body.protein_g !== undefined) {
+            updates.push("proteins = ?"); values.push(body.proteins || body.protein_g);
+          }
+          if (body.fats !== undefined || body.fat_g !== undefined) {
+            updates.push("fats = ?"); values.push(body.fats || body.fat_g);
+          }
+          if (body.carbs !== undefined || body.carbs_g !== undefined) {
+            updates.push("carbs = ?"); values.push(body.carbs || body.carbs_g);
+          }
+          if (body.fiber !== undefined || body.fiber_g !== undefined) {
+            updates.push("fiber = ?"); values.push(body.fiber || body.fiber_g);
+          }
+          if (body.meal_type !== undefined) { updates.push("meal_type = ?"); values.push(body.meal_type); }
+          if (body.health_score !== undefined || body.healthiness_score !== undefined) {
+            updates.push("healthiness_score = ?"); values.push(body.health_score || body.healthiness_score);
+          }
+          if (body.notes !== undefined) { updates.push("notes = ?"); values.push(body.notes); }
+
+          if (updates.length === 0) {
+            return jsonResponse({ error: "No fields to update" }, 400);
+          }
+
+          values.push(mealId, userId);
+          await env.DB.prepare(`UPDATE meals SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`).bind(...values).run();
+
+          const updated = await env.DB.prepare("SELECT * FROM meals WHERE id = ?").bind(mealId).first();
+          return jsonResponse({ success: true, message: "Meal updated", meal: updated });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to update meal", details: String(error) }, 500);
+        }
+      }
+
+      // POST /user/{code}/api/water - записать воду
+      if (subPath === '/api/water' && request.method === 'POST') {
+        try {
+          const body = await request.json() as Record<string, unknown>;
+          const amountMl = (body.amount_ml || 250) as number;
+          const beverageType = (body.beverage_type || 'water') as string;
+          const notes = body.notes as string | null;
+
+          const beverageNames: Record<string, string> = { water: 'Вода', tea: 'Чай', coffee: 'Кофе', juice: 'Сок', other: 'Напиток' };
+          const calories = beverageType === 'juice' ? Math.round(amountMl * 0.4) : 0;
+
+          const result = await env.DB.prepare(
+            `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes)
+             VALUES (?, ?, ?, 0, 0, 0, 0, ?, 'other', ?, ?)`
+          ).bind(userId, `${beverageNames[beverageType] || 'Напиток'} ${amountMl}мл`, calories, amountMl, beverageType === 'water' ? 10 : 8, notes || null).run();
+
+          return jsonResponse({ success: true, message: `Recorded ${amountMl}ml of ${beverageType}`, id: result.meta.last_row_id, amount_ml: amountMl });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to add water", details: String(error) }, 500);
+        }
+      }
+
+      // POST /user/{code}/api/activity - записать активность
+      if (subPath === '/api/activity' && request.method === 'POST') {
+        try {
+          const body = await request.json() as Record<string, unknown>;
+          const activityType = (body.activity_type || 'other') as string;
+          const durationMinutes = (body.duration_minutes || 30) as number;
+          const intensity = (body.intensity || 'moderate') as string;
+          let caloriesBurned = body.calories_burned as number | undefined;
+          const description = body.description as string | null;
+          const notes = body.notes as string | null;
+
+          if (!caloriesBurned) {
+            const profile = await env.DB.prepare("SELECT current_weight FROM user_profiles WHERE user_id = ?").bind(userId).first();
+            const weight = (profile?.current_weight as number) || 70;
+            const met = metValues[activityType]?.[intensity] || 5.0;
+            caloriesBurned = Math.round((met * weight * durationMinutes) / 60);
+          }
+
+          const result = await env.DB.prepare(
+            `INSERT INTO activities (user_id, activity_type, duration_minutes, intensity, calories_burned, description, notes)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(userId, activityType, durationMinutes, intensity, caloriesBurned, description || null, notes || null).run();
+
+          const activityNames: Record<string, string> = { walking: 'Ходьба', running: 'Бег', cycling: 'Велосипед', gym: 'Тренажёрный зал', swimming: 'Плавание', yoga: 'Йога', other: 'Активность' };
+
+          return jsonResponse({
+            success: true,
+            message: `${activityNames[activityType] || 'Активность'}: ${durationMinutes} мин, ${caloriesBurned} ккал`,
+            id: result.meta.last_row_id, activity_type: activityType, duration_minutes: durationMinutes, calories_burned: caloriesBurned
+          });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to add activity", details: String(error) }, 500);
+        }
+      }
+
+      // GET /user/{code}/api/weekly - статистика за неделю
+      if (subPath === '/api/weekly' && request.method === 'GET') {
+        const dailyStats = await env.DB.prepare(
+          `SELECT date(created_at, '+2 hours') as date, COUNT(*) as meal_count, SUM(calories) as total_calories,
+                  SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
+           GROUP BY date(created_at, '+2 hours') ORDER BY date DESC`
+        ).bind(userId).all();
+
+        const weekTotal = await env.DB.prepare(
+          `SELECT COUNT(*) as meal_count, SUM(calories) as total_calories, AVG(calories) as avg_daily_calories,
+                  SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')`
+        ).bind(userId).first();
+
+        return jsonResponse({ period: "Last 7 days", total: weekTotal, daily_breakdown: dailyStats.results });
+      }
+
+      // GET /user/{code}/api/monthly - статистика за месяц
+      if (subPath === '/api/monthly' && request.method === 'GET') {
+        const monthStats = await env.DB.prepare(
+          `SELECT COUNT(*) as meal_count, SUM(calories) as total_calories, AVG(calories) as avg_calories_per_meal,
+                  SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs,
+                  COUNT(DISTINCT date(created_at, '+2 hours')) as days_tracked
+           FROM meals WHERE user_id = ? AND strftime('%Y-%m', created_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')`
+        ).bind(userId).first();
+
+        return jsonResponse({ period: new Date().toISOString().slice(0, 7), summary: monthStats });
+      }
+
+      // POST /user/{code}/api/weight - записать вес
+      if (subPath === '/api/weight' && request.method === 'POST') {
+        try {
+          const body = await request.json() as Record<string, unknown>;
+          const weight = body.weight as number;
+          const notes = body.notes as string | null;
+
+          await env.DB.prepare(`INSERT INTO weight_history (user_id, weight, notes) VALUES (?, ?, ?)`).bind(userId, weight, notes || null).run();
+          await env.DB.prepare(`UPDATE user_profiles SET current_weight = ?, updated_at = datetime('now') WHERE user_id = ?`).bind(weight, userId).run();
+
+          const previousWeight = await env.DB.prepare(
+            `SELECT weight FROM weight_history WHERE user_id = ? ORDER BY recorded_at DESC LIMIT 1 OFFSET 1`
+          ).bind(userId).first();
+          const change = previousWeight ? weight - (previousWeight.weight as number) : 0;
+
+          return jsonResponse({ success: true, message: `Weight ${weight}kg recorded`, weight, change: change ? (change > 0 ? `+${change.toFixed(1)}` : change.toFixed(1)) : null });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to log weight", details: String(error) }, 500);
+        }
+      }
+
+      // GET /user/{code}/api/weight - история веса
+      if (subPath === '/api/weight' && request.method === 'GET') {
+        const limit = parseInt(url.searchParams.get('limit') || '30');
+        const history = await env.DB.prepare(
+          `SELECT weight, notes, datetime(recorded_at, '+2 hours') as recorded_at FROM weight_history
+           WHERE user_id = ? ORDER BY recorded_at DESC LIMIT ?`
+        ).bind(userId, limit).all();
+
+        const profile = await env.DB.prepare(`SELECT target_weight, current_weight FROM user_profiles WHERE user_id = ?`).bind(userId).first();
+        const weights = history.results.map(r => r.weight as number);
+
+        return jsonResponse({
+          history: history.results,
+          stats: {
+            records_count: history.results.length,
+            current_weight: profile?.current_weight,
+            target_weight: profile?.target_weight,
+            min_weight: weights.length > 0 ? Math.min(...weights) : null,
+            max_weight: weights.length > 0 ? Math.max(...weights) : null,
+            total_change: weights.length >= 2 ? weights[0] - weights[weights.length - 1] : 0
+          }
+        });
+      }
+
+      // GET /user/{code}/api/activity - история активностей
+      if (subPath === '/api/activity' && request.method === 'GET') {
+        const limit = parseInt(url.searchParams.get('limit') || '10');
+        const activities = await env.DB.prepare(
+          `SELECT id, activity_type, duration_minutes, intensity, calories_burned, description, notes,
+                  datetime(created_at, '+2 hours') as created_at
+           FROM activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
+        ).bind(userId, limit).all();
+
+        const totalBurned = await env.DB.prepare(
+          `SELECT SUM(calories_burned) as total FROM activities
+           WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+        ).bind(userId).first();
+
+        return jsonResponse({
+          count: activities.results.length,
+          today_calories_burned: totalBurned?.total || 0,
+          activities: activities.results
+        });
+      }
+
+      // DELETE /user/{code}/api/activity/{id} - удалить активность
+      const deleteActivityMatch = subPath.match(/^\/api\/activity\/(\d+)$/);
+      if (deleteActivityMatch && request.method === 'DELETE') {
+        const activityId = parseInt(deleteActivityMatch[1]);
+        const activity = await env.DB.prepare(
+          "SELECT id, activity_type, duration_minutes FROM activities WHERE id = ? AND user_id = ?"
+        ).bind(activityId, userId).first();
+
+        if (!activity) {
+          return jsonResponse({ error: "Activity not found", activity_id: activityId }, 404);
+        }
+
+        await env.DB.prepare("DELETE FROM activities WHERE id = ? AND user_id = ?").bind(activityId, userId).run();
+        return jsonResponse({
+          success: true,
+          message: `Activity "${activity.activity_type}" (${activity.duration_minutes} min) deleted`,
+          deleted_id: activityId
+        });
+      }
+
+      // PATCH /user/{code}/api/activity/{id} - редактировать активность
+      const patchActivityMatch = subPath.match(/^\/api\/activity\/(\d+)$/);
+      if (patchActivityMatch && request.method === 'PATCH') {
+        try {
+          const activityId = parseInt(patchActivityMatch[1]);
+          const activity = await env.DB.prepare(
+            "SELECT * FROM activities WHERE id = ? AND user_id = ?"
+          ).bind(activityId, userId).first();
+
+          if (!activity) {
+            return jsonResponse({ error: "Activity not found", activity_id: activityId }, 404);
+          }
+
+          const body = await request.json() as Record<string, unknown>;
+          const updates: string[] = [];
+          const values: unknown[] = [];
+
+          if (body.activity_type !== undefined) { updates.push("activity_type = ?"); values.push(body.activity_type); }
+          if (body.duration_minutes !== undefined) { updates.push("duration_minutes = ?"); values.push(body.duration_minutes); }
+          if (body.intensity !== undefined) { updates.push("intensity = ?"); values.push(body.intensity); }
+          if (body.calories_burned !== undefined) { updates.push("calories_burned = ?"); values.push(body.calories_burned); }
+          if (body.description !== undefined) { updates.push("description = ?"); values.push(body.description); }
+          if (body.notes !== undefined) { updates.push("notes = ?"); values.push(body.notes); }
+
+          if (updates.length === 0) {
+            return jsonResponse({ error: "No fields to update" }, 400);
+          }
+
+          values.push(activityId, userId);
+          await env.DB.prepare(`UPDATE activities SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`).bind(...values).run();
+
+          const updated = await env.DB.prepare("SELECT * FROM activities WHERE id = ?").bind(activityId).first();
+          return jsonResponse({ success: true, message: "Activity updated", activity: updated });
+        } catch (error) {
+          return jsonResponse({ error: "Failed to update activity", details: String(error) }, 500);
+        }
+      }
+
+      // GET /user/{code}/api/meals/search?q=... - поиск еды
+      if (subPath === '/api/meals/search' && request.method === 'GET') {
+        const query = url.searchParams.get('q') || '';
+        const limit = parseInt(url.searchParams.get('limit') || '20');
+
+        if (!query) {
+          return jsonResponse({ error: "Missing search query parameter 'q'" }, 400);
+        }
+
+        const meals = await env.DB.prepare(
+          `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, created_at
+           FROM meals WHERE user_id = ? AND meal_name LIKE ? ORDER BY created_at DESC LIMIT ?`
+        ).bind(userId, `%${query}%`, limit).all();
+
+        return jsonResponse({ query, count: meals.results.length, meals: meals.results });
+      }
+
+      // DELETE /user/{code}/api/weight/{id} - удалить запись веса
+      const deleteWeightMatch = subPath.match(/^\/api\/weight\/(\d+)$/);
+      if (deleteWeightMatch && request.method === 'DELETE') {
+        const weightId = parseInt(deleteWeightMatch[1]);
+        const weightRecord = await env.DB.prepare(
+          "SELECT id, weight FROM weight_history WHERE id = ? AND user_id = ?"
+        ).bind(weightId, userId).first();
+
+        if (!weightRecord) {
+          return jsonResponse({ error: "Weight record not found", weight_id: weightId }, 404);
+        }
+
+        await env.DB.prepare("DELETE FROM weight_history WHERE id = ? AND user_id = ?").bind(weightId, userId).run();
+        return jsonResponse({
+          success: true,
+          message: `Weight record ${weightRecord.weight}kg deleted`,
+          deleted_id: weightId
+        });
+      }
+
+      // GET /user/{code}/api/recommendations - рекомендации
+      if (subPath === '/api/recommendations' && request.method === 'GET') {
+        const profile = await env.DB.prepare(
+          "SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?"
+        ).bind(userId).first();
+
+        if (!profile) {
+          return jsonResponse({ error: "Profile not set up. Use set_user_profile first." }, 404);
+        }
+
+        const today = await env.DB.prepare(
+          `SELECT COALESCE(SUM(calories), 0) as calories, COALESCE(SUM(proteins), 0) as proteins,
+                  COALESCE(SUM(fats), 0) as fats, COALESCE(SUM(carbs), 0) as carbs
+           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+        ).bind(userId).first();
+
+        const calorieGoal = profile.daily_calorie_goal as number;
+        const proteinGoal = profile.protein_goal as number;
+        const caloriesEaten = (today?.calories || 0) as number;
+        const proteinEaten = (today?.proteins || 0) as number;
+        const caloriesLeft = calorieGoal - caloriesEaten;
+        const proteinLeft = proteinGoal - proteinEaten;
+
+        let recommendations: string[] = [];
+        if (caloriesLeft <= 0) {
+          recommendations.push("Дневной лимит калорий достигнут. Рекомендуется не есть больше или выбрать очень лёгкие продукты.");
+        } else if (caloriesLeft < 200) {
+          recommendations.push(`Осталось мало калорий (${caloriesLeft} ккал). Подойдут: овощной салат, огурцы, зелёный чай.`);
+        } else if (proteinLeft > 20) {
+          recommendations.push(`Нужно добрать белок (${Math.round(proteinLeft)}г). Подойдут: куриная грудка, творог, яйца, рыба.`);
+        } else if (caloriesLeft > 500) {
+          recommendations.push(`Ещё можно съесть полноценный приём пищи (~${caloriesLeft} ккал).`);
+        } else {
+          recommendations.push(`Осталось ${caloriesLeft} ккал. Подойдёт лёгкий перекус или небольшой ужин.`);
+        }
+
+        return jsonResponse({
+          remaining: { calories: caloriesLeft, protein: Math.round(proteinLeft) },
+          eaten_today: { calories: caloriesEaten, protein: Math.round(proteinEaten) },
+          goals: { calories: calorieGoal, protein: proteinGoal },
+          recommendations
+        });
+      }
+
+      // /user/{code}/sse - MCP SSE для Claude
+      if (subPath.startsWith('/sse')) {
+        // Перенаправляем на стандартный SSE handler с code
+        url.pathname = subPath;
+        url.searchParams.set("code", userCode);
+        if (!url.searchParams.has("sessionId")) {
+          url.searchParams.set("sessionId", userCode);
+        }
+        const modifiedRequest = new Request(url.toString(), request);
+        const ctxWithProps = { ...ctx, props: { userCode } };
+        return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
+      }
+
+      return jsonResponse({ error: "Unknown endpoint", path: subPath }, 404);
     }
 
     // === User Registration API ===
@@ -1090,6 +2348,87 @@ export default {
         const error = e as Error;
         return jsonResponse({ error: error.message }, 400);
       }
+    }
+
+    // GET /openapi.json - OpenAPI schema for ChatGPT Actions
+    if (url.pathname === "/openapi.json" || url.pathname === "/.well-known/openapi.json") {
+      const openApiSchema = {
+        openapi: "3.1.0",
+        info: {
+          title: "Calories Tracker API",
+          description: "API for tracking meals and nutrition. Use your personal code from Telegram bot for authentication.",
+          version: "1.0.0"
+        },
+        servers: [{ url: "https://calories-mcp.icynarco112.workers.dev", description: "Production server" }],
+        paths: {
+          "/api/chatgpt/meals": {
+            post: {
+              operationId: "addMeal",
+              summary: "Add a meal to the tracker",
+              description: "Record a meal with its nutritional information",
+              parameters: [{
+                name: "code", in: "query", required: true,
+                schema: { type: "string" },
+                description: "User authentication code from Telegram bot"
+              }],
+              requestBody: {
+                required: true,
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "object",
+                      required: ["name", "calories_kcal"],
+                      properties: {
+                        name: { type: "string", description: "Name of the meal" },
+                        calories_kcal: { type: "integer", description: "Calories in kcal" },
+                        protein_g: { type: "number", description: "Protein in grams" },
+                        fat_g: { type: "number", description: "Fat in grams" },
+                        carbs_g: { type: "number", description: "Carbs in grams" },
+                        fiber_g: { type: "number", description: "Fiber in grams" },
+                        meal_type: { type: "string", enum: ["breakfast", "lunch", "dinner", "snack", "other"] },
+                        health_score: { type: "integer", minimum: 1, maximum: 10 }
+                      }
+                    }
+                  }
+                }
+              },
+              responses: {
+                "200": { description: "Meal added successfully" },
+                "400": { description: "Bad request" },
+                "404": { description: "User not found" }
+              }
+            }
+          },
+          "/api/chatgpt/today": {
+            get: {
+              operationId: "getTodaySummary",
+              summary: "Get today's nutrition summary",
+              description: "Get all meals logged today and totals",
+              parameters: [{
+                name: "code", in: "query", required: true,
+                schema: { type: "string" },
+                description: "User authentication code"
+              }],
+              responses: { "200": { description: "Today's summary" } }
+            }
+          },
+          "/api/chatgpt/profile": {
+            get: {
+              operationId: "getUserProfile",
+              summary: "Get user profile and goals",
+              parameters: [{
+                name: "code", in: "query", required: true,
+                schema: { type: "string" },
+                description: "User authentication code"
+              }],
+              responses: { "200": { description: "User profile" } }
+            }
+          }
+        }
+      };
+      return new Response(JSON.stringify(openApiSchema, null, 2), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
     }
 
     // GET /api/user - get user by telegram_id
@@ -1988,18 +3327,194 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
       }
     }
 
+    // ============ REST API FOR CHATGPT ============
+    // These endpoints work with ?code=USER_CODE for authentication
+    // ChatGPT Actions will use these instead of MCP
+
+    // POST /api/chatgpt/meals - Add a meal (ChatGPT compatible)
+    if (url.pathname === "/api/chatgpt/meals" && request.method === "POST") {
+      const userCode = url.searchParams.get("code");
+      if (!userCode) {
+        return jsonResponse({ error: "code parameter required" }, 400);
+      }
+
+      const userId = await getUserIdByCode(env.DB, userCode);
+      if (!userId) {
+        return jsonResponse({ error: "User not found. Register via Telegram bot first." }, 404);
+      }
+
+      try {
+        const body = await request.json() as Record<string, unknown>;
+
+        // Support both standard and ChatGPT parameter names
+        const mealName = (body.meal_name || body.name || "Unknown meal") as string;
+        const calories = (body.calories || body.calories_kcal || 0) as number;
+        const proteins = (body.proteins || body.protein_g || 0) as number;
+        const fats = (body.fats || body.fat_g || 0) as number;
+        const carbs = (body.carbs || body.carbs_g || 0) as number;
+        const fiber = (body.fiber || body.fiber_g || 0) as number;
+        const waterMl = (body.water_ml || 0) as number;
+        const mealType = (body.meal_type || "other") as string;
+        const healthScore = (body.healthiness_score || body.health_score || 5) as number;
+        const notes = (body.notes || null) as string | null;
+
+        // Check for duplicate
+        const recentDuplicate = await env.DB.prepare(
+          `SELECT id FROM meals WHERE user_id = ? AND meal_name = ? AND calories BETWEEN ? AND ? AND created_at > datetime('now', '-3 minutes') LIMIT 1`
+        ).bind(userId, mealName, Math.floor(calories * 0.9), Math.ceil(calories * 1.1)).first();
+
+        if (recentDuplicate) {
+          return jsonResponse({
+            success: true,
+            message: `Meal "${mealName}" already recorded recently`,
+            duplicate: true,
+            id: recentDuplicate.id
+          });
+        }
+
+        const result = await env.DB.prepare(
+          `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(userId, mealName, calories, proteins, fats, carbs, fiber, waterMl, mealType, healthScore, notes).run();
+
+        return jsonResponse({
+          success: true,
+          message: `Meal "${mealName}" added successfully!`,
+          id: result.meta.last_row_id,
+          calories: calories,
+          proteins: proteins,
+          fats: fats,
+          carbs: carbs
+        });
+      } catch (error) {
+        console.error("Error adding meal:", error);
+        return jsonResponse({ error: "Failed to add meal", details: String(error) }, 500);
+      }
+    }
+
+    // GET /api/chatgpt/today - Get today's summary (ChatGPT compatible)
+    if (url.pathname === "/api/chatgpt/today" && request.method === "GET") {
+      const userCode = url.searchParams.get("code");
+      if (!userCode) {
+        return jsonResponse({ error: "code parameter required" }, 400);
+      }
+
+      const userId = await getUserIdByCode(env.DB, userCode);
+      if (!userId) {
+        return jsonResponse({ error: "User not found" }, 404);
+      }
+
+      const meals = await env.DB.prepare(
+        `SELECT meal_name, calories, proteins, fats, carbs, fiber, meal_type, healthiness_score, created_at
+         FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
+         ORDER BY created_at DESC`
+      ).bind(userId).all();
+
+      const totals = await env.DB.prepare(
+        `SELECT SUM(calories) as total_calories, SUM(proteins) as total_proteins,
+                SUM(fats) as total_fats, SUM(carbs) as total_carbs, SUM(fiber) as total_fiber,
+                COUNT(*) as meal_count
+         FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+      ).bind(userId).first();
+
+      const profile = await env.DB.prepare(
+        `SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?`
+      ).bind(userId).first();
+
+      const calorieGoal = (profile?.daily_calorie_goal || 2000) as number;
+      const proteinGoal = (profile?.protein_goal || 100) as number;
+      const totalCalories = (totals?.total_calories || 0) as number;
+      const totalProteins = (totals?.total_proteins || 0) as number;
+
+      return jsonResponse({
+        date: new Date().toISOString().split('T')[0],
+        meals: meals.results,
+        totals: {
+          calories: totalCalories,
+          proteins: totalProteins,
+          fats: totals?.total_fats || 0,
+          carbs: totals?.total_carbs || 0,
+          fiber: totals?.total_fiber || 0,
+          meal_count: totals?.meal_count || 0
+        },
+        goals: {
+          calorie_goal: calorieGoal,
+          protein_goal: proteinGoal,
+          calories_remaining: calorieGoal - totalCalories,
+          protein_remaining: proteinGoal - totalProteins
+        }
+      });
+    }
+
+    // GET /api/chatgpt/profile - Get user profile (ChatGPT compatible)
+    if (url.pathname === "/api/chatgpt/profile" && request.method === "GET") {
+      const userCode = url.searchParams.get("code");
+      if (!userCode) {
+        return jsonResponse({ error: "code parameter required" }, 400);
+      }
+
+      const userId = await getUserIdByCode(env.DB, userCode);
+      if (!userId) {
+        return jsonResponse({ error: "User not found" }, 404);
+      }
+
+      const profile = await env.DB.prepare(
+        `SELECT * FROM user_profiles WHERE user_id = ?`
+      ).bind(userId).first();
+
+      if (!profile) {
+        return jsonResponse({ error: "Profile not set up" }, 404);
+      }
+
+      return jsonResponse({
+        height_cm: profile.height_cm,
+        current_weight: profile.current_weight,
+        target_weight: profile.target_weight,
+        goal_type: profile.goal_type,
+        activity_level: profile.activity_level,
+        bmr: profile.bmr,
+        tdee: profile.tdee,
+        daily_calorie_goal: profile.daily_calorie_goal,
+        protein_goal: profile.protein_goal
+      });
+    }
+
+    // GET /api/chatgpt/tools - List available tools for ChatGPT (OpenAPI discovery)
+    if (url.pathname === "/api/chatgpt/tools" && request.method === "GET") {
+      return jsonResponse({
+        tools: [
+          { name: "add_meal", endpoint: "POST /api/chatgpt/meals", description: "Add a meal to the tracker" },
+          { name: "get_today", endpoint: "GET /api/chatgpt/today", description: "Get today's nutrition summary" },
+          { name: "get_profile", endpoint: "GET /api/chatgpt/profile", description: "Get user profile and goals" }
+        ],
+        auth: "Pass user code as ?code=USER_CODE query parameter"
+      });
+    }
+
+    // ============ MCP ENDPOINTS ============
+
     // MCP SSE endpoint with user code
     // Pass userCode through props since serveSSE() rewrites the URL
+    // Use userCode as sessionId to ensure stable Durable Object for each user
     if (url.pathname.startsWith("/sse")) {
       const userCode = url.searchParams.get("code");
+
+      // Add sessionId=code to URL for stable DO (fixes ChatGPT "Resource not found" issue)
+      if (userCode && !url.searchParams.has("sessionId")) {
+        url.searchParams.set("sessionId", userCode);
+      }
+
+      const modifiedRequest = new Request(url.toString(), request);
       const ctxWithProps = { ...ctx, props: { userCode } };
-      return CaloriesMCP.serveSSE("/sse").fetch(request, env, ctxWithProps);
+      return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
     }
 
     // MCP Streamable HTTP endpoint
+    // Also use userCode as session identifier for stability
     if (url.pathname.startsWith("/mcp")) {
       const userCode = url.searchParams.get("code");
       const ctxWithProps = { ...ctx, props: { userCode } };
+      console.log(`[MCP] /mcp request, userCode: ${userCode}`);
       return CaloriesMCP.serve("/mcp").fetch(request, env, ctxWithProps);
     }
 

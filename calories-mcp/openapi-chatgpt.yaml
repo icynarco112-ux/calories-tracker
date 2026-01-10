@@ -1,0 +1,206 @@
+openapi: 3.1.0
+info:
+  title: Calories Tracker API
+  description: API for tracking meals and nutrition. Use your personal code from Telegram bot for authentication.
+  version: 1.0.0
+servers:
+  - url: https://calories-mcp.icynarco112.workers.dev
+    description: Production server
+
+paths:
+  /api/chatgpt/meals:
+    post:
+      operationId: addMeal
+      summary: Add a meal to the tracker
+      description: Record a meal with its nutritional information. Call this when user wants to log food they ate.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: User authentication code from Telegram bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - calories_kcal
+              properties:
+                name:
+                  type: string
+                  description: Name of the meal or dish
+                calories_kcal:
+                  type: integer
+                  description: Estimated calories in kcal
+                protein_g:
+                  type: number
+                  description: Protein content in grams
+                fat_g:
+                  type: number
+                  description: Fat content in grams
+                carbs_g:
+                  type: number
+                  description: Carbohydrate content in grams
+                fiber_g:
+                  type: number
+                  description: Fiber content in grams
+                water_ml:
+                  type: integer
+                  description: Water content in milliliters
+                meal_type:
+                  type: string
+                  enum: [breakfast, lunch, dinner, snack, other]
+                  description: Type of meal
+                health_score:
+                  type: integer
+                  minimum: 1
+                  maximum: 10
+                  description: Health score from 1 (unhealthy) to 10 (very healthy)
+                notes:
+                  type: string
+                  description: Additional notes about the meal
+      responses:
+        '200':
+          description: Meal added successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  id:
+                    type: integer
+                  calories:
+                    type: integer
+                  proteins:
+                    type: number
+                  fats:
+                    type: number
+                  carbs:
+                    type: number
+        '400':
+          description: Bad request - missing code parameter
+        '404':
+          description: User not found
+
+  /api/chatgpt/today:
+    get:
+      operationId: getTodaySummary
+      summary: Get today's nutrition summary
+      description: Get all meals logged today and total nutritional values with remaining goals.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: User authentication code from Telegram bot
+      responses:
+        '200':
+          description: Today's summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  date:
+                    type: string
+                    format: date
+                  meals:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        meal_name:
+                          type: string
+                        calories:
+                          type: integer
+                        proteins:
+                          type: number
+                        fats:
+                          type: number
+                        carbs:
+                          type: number
+                        meal_type:
+                          type: string
+                        created_at:
+                          type: string
+                  totals:
+                    type: object
+                    properties:
+                      calories:
+                        type: integer
+                      proteins:
+                        type: number
+                      fats:
+                        type: number
+                      carbs:
+                        type: number
+                      fiber:
+                        type: number
+                      meal_count:
+                        type: integer
+                  goals:
+                    type: object
+                    properties:
+                      calorie_goal:
+                        type: integer
+                      protein_goal:
+                        type: integer
+                      calories_remaining:
+                        type: integer
+                      protein_remaining:
+                        type: integer
+        '404':
+          description: User not found
+
+  /api/chatgpt/profile:
+    get:
+      operationId: getUserProfile
+      summary: Get user profile and goals
+      description: Get user's physical parameters, calculated BMR/TDEE, and nutrition goals.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: User authentication code from Telegram bot
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  height_cm:
+                    type: number
+                  current_weight:
+                    type: number
+                  target_weight:
+                    type: number
+                  goal_type:
+                    type: string
+                    enum: [lose_weight, gain_weight, maintain]
+                  activity_level:
+                    type: string
+                  bmr:
+                    type: integer
+                    description: Basal Metabolic Rate
+                  tdee:
+                    type: integer
+                    description: Total Daily Energy Expenditure
+                  daily_calorie_goal:
+                    type: integer
+                  protein_goal:
+                    type: integer
+        '404':
+          description: User or profile not found

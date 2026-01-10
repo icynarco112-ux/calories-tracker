@@ -339,58 +339,19 @@ async def cmd_register(message: types.Message):
         registered_users[chat_id] = user_code
         logger.info(f"Registered new user: {chat_id} with code {user_code}")
 
-        # Message 1: Success
+        # Create inline keyboard for AI choice
+        ai_choice_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 ChatGPT", callback_data="setup_chatgpt")],
+            [InlineKeyboardButton(text="🧠 Claude", callback_data="setup_claude")]
+        ])
+
+        # Success message with choice
         await message.answer(
             f"✅ *Регистрация успешна!*\n\n"
             f"Ваш персональный код: `{user_code}`\n\n"
-            f"Теперь настроим Claude для отслеживания питания.\n"
-            f"Следуйте инструкции ниже 👇",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # Message 2: Connector setup
-        await message.answer(
-            f"*📋 Шаг 1: Подключите коннектор*\n\n"
-            f"1. Откройте [claude.ai](https://claude.ai)\n"
-            f"2. Нажмите ⚙️ Settings → Connectors\n"
-            f"3. Нажмите 'Add custom connector'\n"
-            f"4. Вставьте URL:\n"
-            f"`{API_BASE_URL}/sse?code={user_code}`\n"
-            f"5. Нажмите 'Add'",
+            f"Выберите AI-ассистента для отслеживания питания:",
             parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True
-        )
-
-        # Message 3: Project setup
-        await message.answer(
-            "*📁 Шаг 2: Создайте проект*\n\n"
-            "1. На главной claude.ai нажмите 'Projects'\n"
-            "2. Нажмите 'Create Project'\n"
-            "3. Назовите его 'Трекер питания'\n"
-            "4. Откройте настройки проекта (⚙️)\n"
-            "5. В 'Custom Instructions' вставьте текст из следующего сообщения\n"
-            "6. В 'Connectors' включите ваш коннектор",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # Message 4: Custom Instructions
-        await message.answer(
-            "*📝 Шаг 3: Скопируйте инструкции*\n\n"
-            "Вставьте этот текст в Custom Instructions проекта:",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        # Send instructions as plain text for easy copying
-        await message.answer(CUSTOM_INSTRUCTIONS)
-
-        # Message 5: Done with keyboard
-        await message.answer(
-            "✨ *Готово!*\n\n"
-            "Теперь откройте проект 'Трекер питания' в Claude и отправьте фото еды — "
-            "он проанализирует и запишет данные!\n\n"
-            "Используйте кнопки ниже для навигации 👇",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_keyboard
+            reply_markup=ai_choice_keyboard
         )
 
     except Exception as e:
@@ -404,7 +365,7 @@ async def cmd_register(message: types.Message):
 
 @dp.message(Command("setup"))
 async def cmd_setup(message: types.Message):
-    """Handle /setup command - show setup instructions."""
+    """Handle /setup command - show AI choice."""
     chat_id = str(message.chat.id)
 
     user = await get_user_by_telegram_id(chat_id)
@@ -419,53 +380,200 @@ async def cmd_setup(message: types.Message):
 
     user_code = user["user_code"]
 
-    # Connector setup
+    ai_choice_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 ChatGPT", callback_data="setup_chatgpt")],
+        [InlineKeyboardButton(text="🧠 Claude", callback_data="setup_claude")]
+    ])
+
     await message.answer(
-        f"*📋 Шаг 1: Подключите коннектор*\n\n"
+        f"🔑 *Ваш код:* `{user_code}`\n\n"
+        f"Выберите AI-ассистента для настройки:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ai_choice_keyboard
+    )
+
+
+# === ChatGPT/Claude Setup Callbacks ===
+
+@dp.callback_query(F.data == "setup_chatgpt")
+async def callback_setup_chatgpt(callback: CallbackQuery):
+    """Handle ChatGPT setup button."""
+    await callback.answer()
+    chat_id = str(callback.message.chat.id)
+    user = await get_user_by_telegram_id(chat_id)
+
+    if not user.get("user_code"):
+        await callback.message.answer("❌ Ошибка: код не найден. Используйте /register")
+        return
+
+    user_code = user["user_code"]
+    await send_chatgpt_setup(callback.message, user_code)
+
+
+@dp.callback_query(F.data == "setup_claude")
+async def callback_setup_claude(callback: CallbackQuery):
+    """Handle Claude setup button."""
+    await callback.answer()
+    chat_id = str(callback.message.chat.id)
+    user = await get_user_by_telegram_id(chat_id)
+
+    if not user.get("user_code"):
+        await callback.message.answer("❌ Ошибка: код не найден. Используйте /register")
+        return
+
+    user_code = user["user_code"]
+    await send_claude_setup(callback.message, user_code)
+
+
+@dp.message(Command("setup_chatgpt"))
+async def cmd_setup_chatgpt(message: types.Message):
+    """Handle /setup_chatgpt command."""
+    chat_id = str(message.chat.id)
+    user = await get_user_by_telegram_id(chat_id)
+
+    if not user.get("user_code"):
+        await message.answer(
+            "❌ Вы не зарегистрированы.\n"
+            "Используйте /register для регистрации.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await send_chatgpt_setup(message, user["user_code"])
+
+
+@dp.message(Command("setup_claude"))
+async def cmd_setup_claude(message: types.Message):
+    """Handle /setup_claude command."""
+    chat_id = str(message.chat.id)
+    user = await get_user_by_telegram_id(chat_id)
+
+    if not user.get("user_code"):
+        await message.answer(
+            "❌ Вы не зарегистрированы.\n"
+            "Используйте /register для регистрации.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await send_claude_setup(message, user["user_code"])
+
+
+async def send_chatgpt_setup(message: types.Message, user_code: str):
+    """Send ChatGPT setup instructions."""
+    personal_url = f"{API_BASE_URL}/user/{user_code}"
+
+    await message.answer(
+        f"🤖 *Настройка ChatGPT*\n\n"
+        f"*Шаг 1: Создайте Custom GPT*\n"
+        f"1. Откройте [chatgpt.com](https://chatgpt.com)\n"
+        f"2. Нажмите на имя → My GPTs → Create a GPT\n"
+        f"3. Назовите его 'Трекер питания'\n\n"
+        f"*Шаг 2: Добавьте Action*\n"
+        f"1. В настройках GPT перейдите в 'Configure'\n"
+        f"2. Нажмите 'Create new action'\n"
+        f"3. Нажмите 'Import from URL'\n"
+        f"4. Вставьте URL:\n"
+        f"`{personal_url}/openapi.json`\n"
+        f"5. Нажмите 'Import'\n\n"
+        f"*Шаг 3: Настройте Instructions*\n"
+        f"Добавьте в Instructions:",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+    # Send instructions for ChatGPT
+    chatgpt_instructions = (
+        "Ты — персональный диетолог и трекер питания.\n\n"
+        "Когда пользователь описывает еду или отправляет фото:\n"
+        "1. Определи название блюда\n"
+        "2. Оцени калории и БЖУ\n"
+        "3. Используй addMeal чтобы записать\n"
+        "4. Покажи итог дня с getTodaySummary\n\n"
+        "Всегда будь дружелюбным и мотивирующим!"
+    )
+    await message.answer(chatgpt_instructions)
+
+    await message.answer(
+        "✨ *Готово!*\n\n"
+        "Теперь отправьте фото еды в ваш Custom GPT — "
+        "он проанализирует и запишет данные!\n\n"
+        "Используйте /setup_claude для настройки Claude.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard
+    )
+
+
+async def send_claude_setup(message: types.Message, user_code: str):
+    """Send Claude setup instructions."""
+    personal_url = f"{API_BASE_URL}/user/{user_code}"
+    sse_url = f"{personal_url}/sse"
+
+    await message.answer(
+        f"🧠 *Настройка Claude*\n\n"
+        f"*Вариант 1: Claude.ai (веб)*\n"
         f"1. Откройте [claude.ai](https://claude.ai)\n"
         f"2. Нажмите ⚙️ Settings → Connectors\n"
         f"3. Нажмите 'Add custom connector'\n"
         f"4. Вставьте URL:\n"
-        f"`{API_BASE_URL}/sse?code={user_code}`\n"
+        f"`{sse_url}`\n"
         f"5. Нажмите 'Add'",
         parse_mode=ParseMode.MARKDOWN,
         disable_web_page_preview=True
     )
 
-    # Project setup
     await message.answer(
-        "*📁 Шаг 2: Создайте проект*\n\n"
+        "*📁 Создайте проект*\n\n"
         "1. На главной claude.ai нажмите 'Projects'\n"
-        "2. Нажмите 'Create Project'\n"
-        "3. Назовите его 'Трекер питания'\n"
-        "4. Откройте настройки проекта (⚙️)\n"
-        "5. В 'Custom Instructions' вставьте текст из следующего сообщения\n"
-        "6. В 'Connectors' включите ваш коннектор",
+        "2. Создайте проект 'Трекер питания'\n"
+        "3. В настройках проекта:\n"
+        "   • Включите ваш коннектор\n"
+        "   • Добавьте инструкции из следующего сообщения",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Custom Instructions
     await message.answer(
-        "*📝 Шаг 3: Скопируйте инструкции*\n\n"
-        "Вставьте этот текст в Custom Instructions проекта:",
+        "*📝 Инструкции для Claude:*",
         parse_mode=ParseMode.MARKDOWN
     )
 
     await message.answer(CUSTOM_INSTRUCTIONS)
 
+    await message.answer(
+        f"*Вариант 2: Claude Code (CLI)*\n\n"
+        f"Добавьте в `.claude/settings.json`:\n"
+        f"```json\n"
+        f'{{"mcpServers": {{"calories": {{"url": "{sse_url}"}}}}}}\n'
+        f"```",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    await message.answer(
+        "✨ *Готово!*\n\n"
+        "Теперь откройте проект 'Трекер питания' в Claude и отправьте фото еды!\n\n"
+        "Используйте /setup_chatgpt для настройки ChatGPT.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard
+    )
+
 
 @dp.message(Command("mycode"))
 async def cmd_mycode(message: types.Message):
-    """Handle /mycode command - show user's code."""
+    """Handle /mycode command - show user's code and URLs."""
     chat_id = str(message.chat.id)
 
     user = await get_user_by_telegram_id(chat_id)
 
     if user.get("user_code"):
+        user_code = user["user_code"]
+        personal_url = f"{API_BASE_URL}/user/{user_code}"
         await message.answer(
-            f"🔑 *Ваш код:* `{user['user_code']}`\n\n"
-            f"URL для Claude коннектора:\n"
-            f"`{API_BASE_URL}/sse?code={user['user_code']}`",
+            f"🔑 *Ваш код:* `{user_code}`\n\n"
+            f"*🤖 Для ChatGPT:*\n"
+            f"`{personal_url}/openapi.json`\n\n"
+            f"*🧠 Для Claude:*\n"
+            f"`{personal_url}/sse`\n\n"
+            f"Используйте /setup для инструкций.",
             parse_mode=ParseMode.MARKDOWN
         )
     else:
@@ -482,11 +590,15 @@ async def cmd_help(message: types.Message):
     await message.answer(
         "📖 *Как пользоваться*\n\n"
         "*Регистрация:*\n"
-        "1. Напишите /register чтобы получить код\n"
-        "2. Добавьте коннектор в Claude с вашим кодом\n"
-        "3. Отправляйте фото еды Claude для анализа\n\n"
-        "*Доступные команды:*\n"
-        "/register — зарегистрироваться\n"
+        "1. /register — получить код\n"
+        "2. Выберите ChatGPT или Claude\n"
+        "3. Отправляйте фото еды для анализа\n\n"
+        "*Настройка AI:*\n"
+        "/setup — выбрать AI-ассистента\n"
+        "/setup\\_chatgpt — инструкции для ChatGPT\n"
+        "/setup\\_claude — инструкции для Claude\n"
+        "/mycode — показать ваши URL\n\n"
+        "*Профиль и статистика:*\n"
         "/profile — ваш профиль и цели\n"
         "/setgoal — настроить профиль\n"
         "/weight — записать текущий вес\n"
