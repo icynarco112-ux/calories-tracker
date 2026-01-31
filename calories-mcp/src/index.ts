@@ -2689,7 +2689,10 @@ export default {
 
       // /user/{code}/mcp - unified MCP endpoint (Streamable HTTP)
       if (subPath.startsWith('/mcp')) {
-        if (request.method === "GET" && !wantsEventStream(request)) {
+        if (request.method === "GET") {
+          if (wantsEventStream(request)) {
+            return sseResponse(`/user/${userCode}/mcp`);
+          }
           return jsonResponse({ endpoint: `/user/${userCode}/mcp`, transport: "streamable-http" });
         }
         url.pathname = "/mcp";
