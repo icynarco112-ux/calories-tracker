@@ -12,9 +12,13 @@ database_id = "d89913e3-d0cc-4bb7-8165-303a26fdf483"
 # Durable Objects for MCP
 [[durable_objects.bindings]]
 name = "MCP_OBJECT"
-class_name = "CaloriesMCP"
+class_name = "CaloriesMCPv2"
 
 # Migrations for Durable Objects
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CaloriesMCP"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CaloriesMCPv2"]

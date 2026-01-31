@@ -22,6 +22,30 @@ async function getUserIdByCode(db: D1Database, userCode: string): Promise<number
   return user?.id as number || null;
 }
 
+function sseResponse(endpoint: string): Response {
+  const encoder = new TextEncoder();
+  let interval: number | undefined;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpoint}\n\n`));
+      interval = setInterval(() => {
+        controller.enqueue(encoder.encode(`event: ping\ndata: \n\n`));
+      }, 25000);
+    },
+    cancel() {
+      if (interval) clearInterval(interval);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+
 // Helper to get user_id from telegram_id
 async function getUserIdByTelegram(db: D1Database, telegramId: string): Promise<number | null> {
   const user = await db.prepare(
@@ -378,7 +402,7 @@ function parseRecordDate(dateStr?: string): string | null {
 }
 
 // MCP Server with Calories Tracker tools (multi-user support)
-export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
+export class CaloriesMCPv2 extends McpAgent<Env, unknown, unknown> {
   server = new McpServer({
     name: "calories-tracker",
     version: "2.0.0",
@@ -2658,33 +2682,24 @@ export default {
         });
       }
 
-      // /user/{code}/sse - MCP SSE для Claude
+      // /user/{code}/sse - MCP SSE for Claude (lightweight)
       if (subPath.startsWith('/sse')) {
-        // Перенаправляем на стандартный SSE handler с code
-        url.pathname = subPath;
-        url.searchParams.set("code", userCode);
-        if (!url.searchParams.has("sessionId")) {
-          url.searchParams.set("sessionId", userCode);
-        }
-        const modifiedRequest = new Request(url.toString(), request);
-        const ctxWithProps = { ...ctx, props: { userCode } };
-        return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
+        return sseResponse(`/user/${userCode}/mcp`);
       }
 
-      // /user/{code}/mcp - unified MCP endpoint (Streamable HTTP + SSE)
+      // /user/{code}/mcp - unified MCP endpoint (Streamable HTTP)
       if (subPath.startsWith('/mcp')) {
-        const useSse = request.method === "GET" || wantsEventStream(request);
-        url.pathname = useSse ? "/sse" : "/mcp";
+        if (request.method === "GET" && !wantsEventStream(request)) {
+          return jsonResponse({ endpoint: `/user/${userCode}/mcp`, transport: "streamable-http" });
+        }
+        url.pathname = "/mcp";
         url.searchParams.set("code", userCode);
         if (!url.searchParams.has("sessionId")) {
           url.searchParams.set("sessionId", userCode);
         }
         const modifiedRequest = new Request(url.toString(), request);
         const ctxWithProps = { ...ctx, props: { userCode } };
-        if (useSse) {
-          return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
-        }
-        return CaloriesMCP.serve("/mcp").fetch(modifiedRequest, env, ctxWithProps);
+        return CaloriesMCPv2.serve("/mcp").fetch(modifiedRequest, env, ctxWithProps);
       }
 
       return jsonResponse({ error: "Unknown endpoint", path: subPath }, 404);
@@ -3939,20 +3954,11 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
 
     // ============ MCP ENDPOINTS ============
 
-    // MCP SSE endpoint with user code
-    // Pass userCode through props since serveSSE() rewrites the URL
-    // Use userCode as sessionId to ensure stable Durable Object for each user
+    // MCP SSE endpoint (legacy) - returns endpoint for streamable HTTP
     if (url.pathname.startsWith("/sse")) {
       const userCode = url.searchParams.get("code");
-
-      // Add sessionId=code to URL for stable DO (fixes ChatGPT "Resource not found" issue)
-      if (userCode && !url.searchParams.has("sessionId")) {
-        url.searchParams.set("sessionId", userCode);
-      }
-
-      const modifiedRequest = new Request(url.toString(), request);
-      const ctxWithProps = { ...ctx, props: { userCode } };
-      return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
+      const endpoint = userCode ? `/mcp?code=${userCode}` : "/mcp";
+      return sseResponse(endpoint);
     }
 
     // MCP Streamable HTTP endpoint
@@ -3961,9 +3967,11 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
       const userCode = url.searchParams.get("code");
       const ctxWithProps = { ...ctx, props: { userCode } };
       console.log(`[MCP] /mcp request, userCode: ${userCode}`);
-      return CaloriesMCP.serve("/mcp").fetch(request, env, ctxWithProps);
+      return CaloriesMCPv2.serve("/mcp").fetch(request, env, ctxWithProps);
     }
 
     return new Response("Not Found", { status: 404 });
   },
 };
+
+export class CaloriesMCP extends CaloriesMCPv2 {}
