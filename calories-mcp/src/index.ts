@@ -9,6 +9,11 @@ export interface Env {
   OPENAI_API_KEY: string;
 }
 
+function wantsEventStream(request: Request): boolean {
+  const accept = request.headers.get("accept") || "";
+  return accept.includes("text/event-stream");
+}
+
 // Helper to get user_id from user_code
 async function getUserIdByCode(db: D1Database, userCode: string): Promise<number | null> {
   const user = await db.prepare(
@@ -1820,7 +1825,7 @@ export default {
         name: "Calories Tracker MCP Server",
         version: "2.0.0",
         personal_url: "/user/{YOUR_CODE}/...",
-        mcp_endpoint: "/user/{YOUR_CODE}/sse",
+        mcp_endpoint: "/user/{YOUR_CODE}/mcp",
         chatgpt_schema: "/user/{YOUR_CODE}/openapi.json",
         api_endpoints: ["/api/register", "/api/user", "/api/today"],
       });
@@ -2664,6 +2669,22 @@ export default {
         const modifiedRequest = new Request(url.toString(), request);
         const ctxWithProps = { ...ctx, props: { userCode } };
         return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
+      }
+
+      // /user/{code}/mcp - unified MCP endpoint (Streamable HTTP + SSE)
+      if (subPath.startsWith('/mcp')) {
+        const useSse = request.method === "GET" || wantsEventStream(request);
+        url.pathname = useSse ? "/sse" : "/mcp";
+        url.searchParams.set("code", userCode);
+        if (!url.searchParams.has("sessionId")) {
+          url.searchParams.set("sessionId", userCode);
+        }
+        const modifiedRequest = new Request(url.toString(), request);
+        const ctxWithProps = { ...ctx, props: { userCode } };
+        if (useSse) {
+          return CaloriesMCP.serveSSE("/sse").fetch(modifiedRequest, env, ctxWithProps);
+        }
+        return CaloriesMCP.serve("/mcp").fetch(modifiedRequest, env, ctxWithProps);
       }
 
       return jsonResponse({ error: "Unknown endpoint", path: subPath }, 404);
