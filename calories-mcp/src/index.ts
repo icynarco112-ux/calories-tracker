@@ -25,6 +25,34 @@ async function getUserIdByTelegram(db: D1Database, telegramId: string): Promise<
   return user?.id as number || null;
 }
 
+// Get Kyiv timezone offset with DST support
+// Kyiv: UTC+2 in winter, UTC+3 in summer (DST)
+// DST starts: last Sunday of March at 03:00 local (01:00 UTC)
+// DST ends: last Sunday of October at 04:00 local (01:00 UTC)
+function getKyivOffset(): string {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+
+  // Last Sunday of March
+  const marchLast = new Date(Date.UTC(year, 2, 31));
+  while (marchLast.getUTCDay() !== 0) {
+    marchLast.setUTCDate(marchLast.getUTCDate() - 1);
+  }
+  marchLast.setUTCHours(1, 0, 0, 0); // 01:00 UTC
+
+  // Last Sunday of October
+  const octLast = new Date(Date.UTC(year, 9, 31));
+  while (octLast.getUTCDay() !== 0) {
+    octLast.setUTCDate(octLast.getUTCDate() - 1);
+  }
+  octLast.setUTCHours(1, 0, 0, 0); // 01:00 UTC
+
+  const utcNow = now.getTime();
+  const isDST = utcNow >= marchLast.getTime() && utcNow < octLast.getTime();
+
+  return isDST ? '+3 hours' : '+2 hours';
+}
+
 // Calculate age from birth date
 function calculateAge(birthDate: string): number {
   const birth = new Date(birthDate);
@@ -163,8 +191,14 @@ const MONTHLY_ANALYSIS_PROMPT = `Ты — диетолог-коуч. Подве�
 ФОКУС АНАЛИЗА:
 1. Общий прогресс к цели (вес, привычки)
 2. Средние показатели vs норма
-3. Регулярность отслеживания (дисциплина)
+3. Регулярность отслеживания — оценивай по ПРОЦЕНТУ дней с записями
 4. Главные достижения и вызовы
+
+ОЦЕНКА ДИСЦИПЛИНЫ (по проценту):
+- 90-100% = отличная дисциплина, похвали!
+- 70-89% = хорошая дисциплина
+- 50-69% = средняя, есть куда расти
+- Ниже 50% = нужно улучшить регулярность
 
 ФОРМАТ:
 🏆 *Итог месяца:* [главное достижение или вызов]
@@ -174,7 +208,6 @@ const MONTHLY_ANALYSIS_PROMPT = `Ты — диетолог-коуч. Подве�
 ПРАВИЛА:
 - Это ИТОГОВЫЙ анализ — будь позитивным но честным
 - Фокус на привычках, не на отдельных днях
-- Если мало дней отслеживания — отметь это
 - До 100 слов`;
 
 // Call OpenAI API
@@ -221,9 +254,10 @@ async function getCachedInsight(
   userId: number,
   insightType: string
 ): Promise<string | null> {
+  const tz = getKyivOffset();
   const cached = await db.prepare(
     `SELECT content FROM ai_insights
-     WHERE user_id = ? AND insight_type = ? AND insight_date = date('now', '+2 hours')
+     WHERE user_id = ? AND insight_type = ? AND insight_date = date('now', '${tz}')
      LIMIT 1`
   ).bind(userId, insightType).first();
   return cached?.content as string || null;
@@ -236,21 +270,106 @@ async function saveInsight(
   insightType: string,
   content: string
 ): Promise<void> {
+  const tz = getKyivOffset();
   await db.prepare(
     `INSERT OR REPLACE INTO ai_insights (user_id, insight_type, insight_date, content)
-     VALUES (?, ?, date('now', '+2 hours'), ?)`
+     VALUES (?, ?, date('now', '${tz}'), ?)`
   ).bind(userId, insightType, content).run();
 }
 
-// Invalidate cached insight when data changes
+// Invalidate all cached insights when data changes (daily, weekly, monthly, tips)
 async function invalidateDailyInsight(
   db: D1Database,
   userId: number
 ): Promise<void> {
+  const tz = getKyivOffset();
   await db.prepare(
     `DELETE FROM ai_insights
-     WHERE user_id = ? AND insight_type = 'daily' AND insight_date = date('now', '+2 hours')`
+     WHERE user_id = ? AND insight_date = date('now', '${tz}')`
   ).bind(userId).run();
+}
+
+// Log errors to database for debugging
+async function logError(
+  db: D1Database,
+  toolName: string,
+  error: unknown,
+  userCode?: string | null,
+  userId?: number | null,
+  rawArgs?: unknown
+): Promise<void> {
+  try {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+
+    await db.prepare(
+      `INSERT INTO error_logs (tool_name, error_message, error_stack, user_code, user_id, raw_args)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(
+      toolName,
+      errorMessage,
+      errorStack || null,
+      userCode || null,
+      userId || null,
+      rawArgs ? JSON.stringify(rawArgs) : null
+    ).run();
+
+    console.error(`[MCP ERROR] ${toolName}: ${errorMessage}`);
+  } catch (logErr) {
+    // Don't fail if logging fails
+    console.error(`[MCP] Failed to log error:`, logErr);
+  }
+}
+
+// Parse date string for backdated records (e.g., "yesterday", "2026-01-10")
+// Returns datetime string in UTC for SQLite or null to use current time
+function parseRecordDate(dateStr?: string): string | null {
+  if (!dateStr) return null;
+
+  // Calculate Kyiv offset in hours
+  const kyivOffsetHours = getKyivOffset() === '+3 hours' ? 3 : 2;
+
+  // Current time in Kyiv
+  const now = new Date();
+  const kyivNow = new Date(now.getTime() + kyivOffsetHours * 60 * 60 * 1000);
+
+  if (dateStr.toLowerCase() === 'yesterday') {
+    // Yesterday in Kyiv
+    const yesterday = new Date(kyivNow);
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+
+    const year = yesterday.getUTCFullYear();
+    const month = String(yesterday.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(yesterday.getUTCDate()).padStart(2, '0');
+
+    // 12:00 Kyiv time -> UTC
+    const utcHour = 12 - kyivOffsetHours;
+    return `${year}-${month}-${day} ${String(utcHour).padStart(2, '0')}:00:00`;
+  }
+
+  // Validate YYYY-MM-DD format
+  const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+  if (!dateRegex.test(dateStr)) {
+    return null;
+  }
+
+  // Check: not in the future (Kyiv time)
+  const todayKyiv = kyivNow.toISOString().split('T')[0];
+  if (dateStr > todayKyiv) {
+    return null;
+  }
+
+  // Check: not older than 7 days
+  const weekAgo = new Date(kyivNow);
+  weekAgo.setUTCDate(weekAgo.getUTCDate() - 7);
+  const weekAgoStr = weekAgo.toISOString().split('T')[0];
+  if (dateStr < weekAgoStr) {
+    return null;
+  }
+
+  // 12:00 Kyiv time -> UTC
+  const utcHour = 12 - kyivOffsetHours;
+  return `${dateStr} ${String(utcHour).padStart(2, '0')}:00:00`;
 }
 
 // MCP Server with Calories Tracker tools (multi-user support)
@@ -288,6 +407,40 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
     const userId = await getUserIdByCode(this.env.DB, userCode);
     console.log(`[MCP] userId for code ${userCode}: ${userId}`);
     return userId;
+  }
+
+  // Helper to get userCode for error logging
+  private async getUserCode(): Promise<string | null> {
+    const props = this.props as { userCode?: string } | undefined;
+    return props?.userCode || await this.ctx.storage.get("userCode") as string | null;
+  }
+
+  // Wrapper to add try-catch to any tool handler
+  private wrapHandler<T>(
+    toolName: string,
+    handler: (args: T) => Promise<{ content: Array<{ type: "text"; text: string }> }>
+  ): (args: T) => Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    return async (args: T) => {
+      const userCode = await this.getUserCode();
+      let userId: number | null = null;
+      try {
+        userId = await this.getUserId();
+        return await handler(args);
+      } catch (error) {
+        console.error(`[MCP] ${toolName} error:`, error);
+        await logError(this.env.DB, toolName, error, userCode, userId, args);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: `Failed to execute ${toolName}`,
+              message: error instanceof Error ? error.message : String(error),
+              hint: "Error has been logged. Try again or check /api/errors"
+            })
+          }]
+        };
+      }
+    };
   }
 
   async init() {
@@ -332,104 +485,138 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
         carbs_g: z.number().optional().describe("Alternative: Carbs in grams"),
         fiber_g: z.number().optional().describe("Alternative: Fiber in grams"),
         health_score: z.number().optional().describe("Alternative: Health score 1-10"),
+        // Date for backdated records
+        date: z.string().optional().describe("Date for the record: 'yesterday' or 'YYYY-MM-DD' format. If not provided, uses current time. Max 7 days back."),
       },
       async (rawArgs) => {
-        // Normalize arguments: support both standard and ChatGPT alternative names
-        const args = {
-          meal_name: rawArgs.meal_name || rawArgs.name || "Unknown meal",
-          calories: rawArgs.calories || rawArgs.calories_kcal || 0,
-          proteins: rawArgs.proteins || rawArgs.protein_g,
-          fats: rawArgs.fats || rawArgs.fat_g,
-          carbs: rawArgs.carbs || rawArgs.carbs_g,
-          fiber: rawArgs.fiber || rawArgs.fiber_g,
-          water_ml: rawArgs.water_ml,
-          meal_type: rawArgs.meal_type,
-          healthiness_score: rawArgs.healthiness_score || rawArgs.health_score,
-          notes: rawArgs.notes,
-        };
-        console.log(`[MCP] add_meal called: ${args.meal_name}, ${args.calories} kcal (raw: ${JSON.stringify(rawArgs)})`);
-        const userId = await this.getUserId();
-        if (!userId) {
-          const props = this.props as { userCode?: string } | undefined;
-          const userCode = props?.userCode || await this.ctx.storage.get("userCode");
-          console.error(`[MCP] add_meal failed: user not found for code ${userCode}`);
+        const props = this.props as { userCode?: string } | undefined;
+        const userCode = props?.userCode || await this.ctx.storage.get("userCode") as string | null;
+        let userId: number | null = null;
+
+        try {
+          // Normalize arguments: support both standard and ChatGPT alternative names
+          const args = {
+            meal_name: rawArgs.meal_name || rawArgs.name || "Unknown meal",
+            calories: rawArgs.calories || rawArgs.calories_kcal || 0,
+            proteins: rawArgs.proteins || rawArgs.protein_g,
+            fats: rawArgs.fats || rawArgs.fat_g,
+            carbs: rawArgs.carbs || rawArgs.carbs_g,
+            fiber: rawArgs.fiber || rawArgs.fiber_g,
+            water_ml: rawArgs.water_ml,
+            meal_type: rawArgs.meal_type,
+            healthiness_score: rawArgs.healthiness_score || rawArgs.health_score,
+            notes: rawArgs.notes,
+            date: rawArgs.date,
+          };
+
+          // Parse date for backdated records
+          const recordDate = parseRecordDate(args.date);
+          const isBackdated = recordDate !== null;
+
+          console.log(`[MCP] add_meal called: ${args.meal_name}, ${args.calories} kcal, date: ${args.date || 'now'} (raw: ${JSON.stringify(rawArgs)})`);
+
+          userId = await this.getUserId();
+          if (!userId) {
+            console.error(`[MCP] add_meal failed: user not found for code ${userCode}`);
+            await logError(this.env.DB, "add_meal", "User not authenticated", userCode, null, rawArgs);
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: "User not authenticated",
+                  hint: "Please register via Telegram bot first using /register command",
+                  userCode: userCode || "not provided"
+                })
+              }],
+            };
+          }
+
+          // Check for duplicate meal (same name and similar calories within last 3 minutes)
+          // Skip duplicate check for backdated records
+          if (!isBackdated) {
+            const recentDuplicate = await this.env.DB.prepare(
+              `SELECT id FROM meals
+               WHERE user_id = ?
+               AND meal_name = ?
+               AND calories BETWEEN ? AND ?
+               AND created_at > datetime('now', '-3 minutes')
+               LIMIT 1`
+            ).bind(
+              userId,
+              args.meal_name,
+              Math.floor(args.calories * 0.9),
+              Math.ceil(args.calories * 1.1)
+            ).first();
+
+            if (recentDuplicate) {
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    success: true,
+                    message: `Meal "${args.meal_name}" already recorded recently`,
+                    duplicate: true,
+                    existing_id: recentDuplicate.id,
+                    calories: args.calories,
+                  }),
+                }],
+              };
+            }
+          }
+
+          const tz = getKyivOffset();
+          const result = await this.env.DB.prepare(
+            `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(datetime(?), datetime('now')))`
+          )
+            .bind(
+              userId,
+              args.meal_name,
+              args.calories,
+              args.proteins ?? 0,
+              args.fats ?? 0,
+              args.carbs ?? 0,
+              args.fiber ?? 0,
+              args.water_ml ?? 0,
+              args.meal_type ?? "other",
+              args.healthiness_score ?? 5,
+              args.notes ?? null,
+              recordDate
+            )
+            .run();
+
+          // Invalidate daily AI analysis cache so next analysis is fresh
+          await invalidateDailyInsight(this.env.DB, userId);
+
+          const dateInfo = isBackdated ? ` for ${args.date}` : '';
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: true,
+                  message: `Meal "${args.meal_name}" added successfully${dateInfo}!`,
+                  calories: args.calories,
+                  id: result.meta.last_row_id,
+                  recorded_for: isBackdated ? args.date : 'today',
+                }),
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] add_meal error:`, error);
+          await logError(this.env.DB, "add_meal", error, userCode, userId, rawArgs);
           return {
             content: [{
               type: "text" as const,
               text: JSON.stringify({
-                error: "User not authenticated",
-                hint: "Please register via Telegram bot first using /register command",
-                userCode: userCode || "not provided"
+                error: "Failed to add meal",
+                message: error instanceof Error ? error.message : String(error),
+                hint: "Error has been logged. Try again or contact support."
               })
             }],
           };
         }
-
-        // Check for duplicate meal (same name and similar calories within last 3 minutes)
-        const recentDuplicate = await this.env.DB.prepare(
-          `SELECT id FROM meals
-           WHERE user_id = ?
-           AND meal_name = ?
-           AND calories BETWEEN ? AND ?
-           AND created_at > datetime('now', '-3 minutes')
-           LIMIT 1`
-        ).bind(
-          userId,
-          args.meal_name,
-          Math.floor(args.calories * 0.9),
-          Math.ceil(args.calories * 1.1)
-        ).first();
-
-        if (recentDuplicate) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: true,
-                message: `Meal "${args.meal_name}" already recorded recently`,
-                duplicate: true,
-                existing_id: recentDuplicate.id,
-                calories: args.calories,
-              }),
-            }],
-          };
-        }
-
-        const result = await this.env.DB.prepare(
-          `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        )
-          .bind(
-            userId,
-            args.meal_name,
-            args.calories,
-            args.proteins ?? 0,
-            args.fats ?? 0,
-            args.carbs ?? 0,
-            args.fiber ?? 0,
-            args.water_ml ?? 0,
-            args.meal_type ?? "other",
-            args.healthiness_score ?? 5,
-            args.notes ?? null
-          )
-          .run();
-
-        // Invalidate daily AI analysis cache so next analysis is fresh
-        await invalidateDailyInsight(this.env.DB, userId);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                success: true,
-                message: `Meal "${args.meal_name}" added successfully!`,
-                calories: args.calories,
-                id: result.meta.last_row_id,
-              }),
-            },
-          ],
-        };
       }
     );
 
@@ -444,54 +631,82 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
           .optional()
           .describe("Type of beverage (default: water)"),
         notes: z.string().optional().describe("Additional notes"),
+        date: z.string().optional().describe("Date for the record: 'yesterday' or 'YYYY-MM-DD' format. If not provided, uses current time. Max 7 days back."),
       },
       async (args) => {
-        const userId = await this.getUserId();
-        if (!userId) {
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+        const props = this.props as { userCode?: string } | undefined;
+        const userCode = props?.userCode || await this.ctx.storage.get("userCode") as string | null;
+        let userId: number | null = null;
+
+        try {
+          // Parse date for backdated records
+          const recordDate = parseRecordDate(args.date);
+          const isBackdated = recordDate !== null;
+
+          userId = await this.getUserId();
+          if (!userId) {
+            await logError(this.env.DB, "add_water", "User not authenticated", userCode, null, args);
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            };
+          }
+
+          const beverageType = args.beverage_type ?? "water";
+          const beverageNames: Record<string, string> = {
+            water: "Вода",
+            tea: "Чай",
+            coffee: "Кофе",
+            juice: "Сок",
+            other: "Напиток",
           };
-        }
 
-        const beverageType = args.beverage_type ?? "water";
-        const beverageNames: Record<string, string> = {
-          water: "Вода",
-          tea: "Чай",
-          coffee: "Кофе",
-          juice: "Сок",
-          other: "Напиток",
-        };
-
-        const result = await this.env.DB.prepare(
-          `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes)
-           VALUES (?, ?, ?, 0, 0, 0, 0, ?, 'other', ?, ?)`
-        )
-          .bind(
-            userId,
-            `${beverageNames[beverageType]} ${args.amount_ml}мл`,
-            beverageType === "juice" ? Math.round(args.amount_ml * 0.4) : 0,
-            args.amount_ml,
-            beverageType === "water" ? 10 : 8,
-            args.notes ?? null
+          const tz = getKyivOffset();
+          const result = await this.env.DB.prepare(
+            `INSERT INTO meals (user_id, meal_name, calories, proteins, fats, carbs, fiber, water_ml, meal_type, healthiness_score, notes, created_at)
+             VALUES (?, ?, ?, 0, 0, 0, 0, ?, 'other', ?, ?, COALESCE(datetime(?), datetime('now')))`
           )
-          .run();
+            .bind(
+              userId,
+              `${beverageNames[beverageType]} ${args.amount_ml}мл`,
+              beverageType === "juice" ? Math.round(args.amount_ml * 0.4) : 0,
+              args.amount_ml,
+              beverageType === "water" ? 10 : 8,
+              args.notes ?? null,
+              recordDate
+            )
+            .run();
 
-        // Invalidate daily AI analysis cache
-        await invalidateDailyInsight(this.env.DB, userId);
+          // Invalidate daily AI analysis cache
+          await invalidateDailyInsight(this.env.DB, userId);
 
-        return {
-          content: [
-            {
+          const dateInfo = isBackdated ? ` for ${args.date}` : '';
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({
+                  success: true,
+                  message: `Recorded ${args.amount_ml}ml of ${beverageType}${dateInfo}`,
+                  amount_ml: args.amount_ml,
+                  id: result.meta.last_row_id,
+                  recorded_for: isBackdated ? args.date : 'today',
+                }),
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] add_water error:`, error);
+          await logError(this.env.DB, "add_water", error, userCode, userId, args);
+          return {
+            content: [{
               type: "text" as const,
               text: JSON.stringify({
-                success: true,
-                message: `Recorded ${args.amount_ml}ml of ${beverageType}`,
-                amount_ml: args.amount_ml,
-                id: result.meta.last_row_id,
-              }),
-            },
-          ],
-        };
+                error: "Failed to add water",
+                message: error instanceof Error ? error.message : String(error)
+              })
+            }],
+          };
+        }
       }
     );
 
@@ -524,71 +739,98 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
           .string()
           .optional()
           .describe("Additional notes about the activity"),
+        date: z.string().optional().describe("Date for the record: 'yesterday' or 'YYYY-MM-DD' format. If not provided, uses current time. Max 7 days back."),
       },
       async (args) => {
-        const userId = await this.getUserId();
-        if (!userId) {
+        const userCode = await this.getUserCode();
+        let userId: number | null = null;
+
+        try {
+          // Parse date for backdated records
+          const recordDate = parseRecordDate(args.date);
+          const isBackdated = recordDate !== null;
+
+          userId = await this.getUserId();
+          if (!userId) {
+            await logError(this.env.DB, "add_activity", "User not authenticated", userCode, null, args);
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            };
+          }
+
+          const intensity = args.intensity || "moderate";
+
+          // Calculate calories if not provided
+          let caloriesBurned = args.calories_burned;
+          if (!caloriesBurned) {
+            // Get user weight from profile for more accurate calculation
+            const profile = await this.env.DB.prepare(
+              "SELECT current_weight FROM user_profiles WHERE user_id = ?"
+            ).bind(userId).first();
+            const weight = (profile?.current_weight as number) || 70; // Default 70kg
+
+            const met = metValues[args.activity_type]?.[intensity] || 5.0;
+            // Calories = MET × weight (kg) × duration (hours)
+            caloriesBurned = Math.round((met * weight * args.duration_minutes) / 60);
+          }
+
+          const tz = getKyivOffset();
+          const result = await this.env.DB.prepare(
+            `INSERT INTO activities (user_id, activity_type, duration_minutes, intensity, calories_burned, description, notes, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(datetime(?), datetime('now')))`
+          ).bind(
+            userId,
+            args.activity_type,
+            args.duration_minutes,
+            intensity,
+            caloriesBurned,
+            args.description || null,
+            args.notes || null,
+            recordDate
+          ).run();
+
+          // Invalidate daily AI analysis cache
+          await invalidateDailyInsight(this.env.DB, userId);
+
+          const activityNames: Record<string, string> = {
+            walking: "Ходьба",
+            running: "Бег",
+            cycling: "Велосипед",
+            gym: "Тренажёрный зал",
+            swimming: "Плавание",
+            yoga: "Йога",
+            other: "Активность",
+          };
+
+          const dateInfo = isBackdated ? ` за ${args.date}` : '';
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                message: `${activityNames[args.activity_type]} записана${dateInfo}: ${args.duration_minutes} мин, ${caloriesBurned} ккал сожжено`,
+                activity_type: args.activity_type,
+                duration_minutes: args.duration_minutes,
+                intensity,
+                calories_burned: caloriesBurned,
+                id: result.meta.last_row_id,
+                recorded_for: isBackdated ? args.date : 'today',
+              }),
+            }],
+          };
+        } catch (error) {
+          console.error(`[MCP] add_activity error:`, error);
+          await logError(this.env.DB, "add_activity", error, userCode, userId, args);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Failed to add activity",
+                message: error instanceof Error ? error.message : String(error)
+              })
+            }],
           };
         }
-
-        const intensity = args.intensity || "moderate";
-
-        // Calculate calories if not provided
-        let caloriesBurned = args.calories_burned;
-        if (!caloriesBurned) {
-          // Get user weight from profile for more accurate calculation
-          const profile = await this.env.DB.prepare(
-            "SELECT current_weight FROM user_profiles WHERE user_id = ?"
-          ).bind(userId).first();
-          const weight = (profile?.current_weight as number) || 70; // Default 70kg
-
-          const met = metValues[args.activity_type]?.[intensity] || 5.0;
-          // Calories = MET × weight (kg) × duration (hours)
-          caloriesBurned = Math.round((met * weight * args.duration_minutes) / 60);
-        }
-
-        const result = await this.env.DB.prepare(
-          `INSERT INTO activities (user_id, activity_type, duration_minutes, intensity, calories_burned, description, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).bind(
-          userId,
-          args.activity_type,
-          args.duration_minutes,
-          intensity,
-          caloriesBurned,
-          args.description || null,
-          args.notes || null
-        ).run();
-
-        // Invalidate daily AI analysis cache
-        await invalidateDailyInsight(this.env.DB, userId);
-
-        const activityNames: Record<string, string> = {
-          walking: "Ходьба",
-          running: "Бег",
-          cycling: "Велосипед",
-          gym: "Тренажёрный зал",
-          swimming: "Плавание",
-          yoga: "Йога",
-          other: "Активность",
-        };
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: true,
-              message: `${activityNames[args.activity_type]} записана: ${args.duration_minutes} мин, ${caloriesBurned} ккал сожжено`,
-              activity_type: args.activity_type,
-              duration_minutes: args.duration_minutes,
-              intensity,
-              calories_burned: caloriesBurned,
-              id: result.meta.last_row_id,
-            }),
-          }],
-        };
       }
     );
 
@@ -598,51 +840,71 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
       "Get nutrition summary for today including total calories, macros, and all meals.",
       {},
       async () => {
-        const userId = await this.getUserId();
-        if (!userId) {
+        const props = this.props as { userCode?: string } | undefined;
+        const userCode = props?.userCode || await this.ctx.storage.get("userCode") as string | null;
+        let userId: number | null = null;
+
+        try {
+          userId = await this.getUserId();
+          if (!userId) {
+            await logError(this.env.DB, "get_today_summary", "User not authenticated", userCode, null, {});
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            };
+          }
+
+          const tz = getKyivOffset();
+          const summary = await this.env.DB.prepare(
+            `SELECT
+              COUNT(*) as meal_count,
+              COALESCE(SUM(calories), 0) as total_calories,
+              COALESCE(SUM(proteins), 0) as total_proteins,
+              COALESCE(SUM(fats), 0) as total_fats,
+              COALESCE(SUM(carbs), 0) as total_carbs,
+              COALESCE(SUM(fiber), 0) as total_fiber,
+              COALESCE(SUM(water_ml), 0) as total_water,
+              COALESCE(AVG(healthiness_score), 0) as avg_healthiness
+             FROM meals
+             WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
+          ).bind(userId).first();
+
+          const meals = await this.env.DB.prepare(
+            `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, healthiness_score,
+                    strftime('%H:%M', created_at, '${tz}') as time
+             FROM meals
+             WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
+             ORDER BY created_at DESC`
+          ).bind(userId).all();
+
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    date: new Date().toISOString().split("T")[0],
+                    summary,
+                    meals: meals.results,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] get_today_summary error:`, error);
+          await logError(this.env.DB, "get_today_summary", error, userCode, userId, {});
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Failed to get today summary",
+                message: error instanceof Error ? error.message : String(error)
+              })
+            }],
           };
         }
-
-        const summary = await this.env.DB.prepare(
-          `SELECT
-            COUNT(*) as meal_count,
-            COALESCE(SUM(calories), 0) as total_calories,
-            COALESCE(SUM(proteins), 0) as total_proteins,
-            COALESCE(SUM(fats), 0) as total_fats,
-            COALESCE(SUM(carbs), 0) as total_carbs,
-            COALESCE(SUM(fiber), 0) as total_fiber,
-            COALESCE(SUM(water_ml), 0) as total_water,
-            COALESCE(AVG(healthiness_score), 0) as avg_healthiness
-           FROM meals
-           WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
-        ).bind(userId).first();
-
-        const meals = await this.env.DB.prepare(
-          `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, healthiness_score,
-                  strftime('%H:%M', created_at, '+2 hours') as time
-           FROM meals
-           WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
-           ORDER BY created_at DESC`
-        ).bind(userId).all();
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  date: new Date().toISOString().split("T")[0],
-                  summary,
-                  meals: meals.results,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
       }
     );
 
@@ -652,57 +914,76 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
       "Get nutrition summary for the last 7 days with daily breakdown.",
       {},
       async () => {
-        const userId = await this.getUserId();
-        if (!userId) {
+        const userCode = await this.getUserCode();
+        let userId: number | null = null;
+
+        try {
+          userId = await this.getUserId();
+          if (!userId) {
+            await logError(this.env.DB, "get_weekly_summary", "User not authenticated", userCode, null, {});
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            };
+          }
+
+          const tz = getKyivOffset();
+          const dailyStats = await this.env.DB.prepare(
+            `SELECT
+              date(created_at, '${tz}') as date,
+              COUNT(*) as meal_count,
+              SUM(calories) as total_calories,
+              SUM(proteins) as total_proteins,
+              SUM(fats) as total_fats,
+              SUM(carbs) as total_carbs,
+              AVG(healthiness_score) as avg_healthiness
+             FROM meals
+             WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+             GROUP BY date(created_at, '${tz}')
+             ORDER BY date DESC`
+          ).bind(userId).all();
+
+          const weekTotal = await this.env.DB.prepare(
+            `SELECT
+              COUNT(*) as meal_count,
+              SUM(calories) as total_calories,
+              AVG(calories) as avg_daily_calories,
+              SUM(proteins) as total_proteins,
+              SUM(fats) as total_fats,
+              SUM(carbs) as total_carbs,
+              AVG(healthiness_score) as avg_healthiness
+             FROM meals
+             WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')`
+          ).bind(userId).first();
+
           return {
-            content: [{ type: "text" as const, text: JSON.stringify({ error: "User not authenticated" }) }],
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    period: "Last 7 days",
+                    total: weekTotal,
+                    daily_breakdown: dailyStats.results,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (error) {
+          console.error(`[MCP] get_weekly_summary error:`, error);
+          await logError(this.env.DB, "get_weekly_summary", error, userCode, userId, {});
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Failed to get weekly summary",
+                message: error instanceof Error ? error.message : String(error)
+              })
+            }],
           };
         }
-
-        const dailyStats = await this.env.DB.prepare(
-          `SELECT
-            date(created_at, '+2 hours') as date,
-            COUNT(*) as meal_count,
-            SUM(calories) as total_calories,
-            SUM(proteins) as total_proteins,
-            SUM(fats) as total_fats,
-            SUM(carbs) as total_carbs,
-            AVG(healthiness_score) as avg_healthiness
-           FROM meals
-           WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-           GROUP BY date(created_at, '+2 hours')
-           ORDER BY date DESC`
-        ).bind(userId).all();
-
-        const weekTotal = await this.env.DB.prepare(
-          `SELECT
-            COUNT(*) as meal_count,
-            SUM(calories) as total_calories,
-            AVG(calories) as avg_daily_calories,
-            SUM(proteins) as total_proteins,
-            SUM(fats) as total_fats,
-            SUM(carbs) as total_carbs,
-            AVG(healthiness_score) as avg_healthiness
-           FROM meals
-           WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')`
-        ).bind(userId).first();
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  period: "Last 7 days",
-                  total: weekTotal,
-                  daily_breakdown: dailyStats.results,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
       }
     );
 
@@ -719,6 +1000,7 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
           };
         }
 
+        const tz = getKyivOffset();
         const monthStats = await this.env.DB.prepare(
           `SELECT
             COUNT(*) as meal_count,
@@ -729,9 +1011,9 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
             SUM(carbs) as total_carbs,
             SUM(fiber) as total_fiber,
             AVG(healthiness_score) as avg_healthiness,
-            COUNT(DISTINCT date(created_at, '+2 hours')) as days_tracked
+            COUNT(DISTINCT date(created_at, '${tz}')) as days_tracked
            FROM meals
-           WHERE user_id = ? AND strftime('%Y-%m', created_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')`
+           WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
         ).bind(userId).first();
 
         return {
@@ -1030,8 +1312,9 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
         }
 
         const limit = args.limit ?? 30;
+        const tz = getKyivOffset();
         const history = await this.env.DB.prepare(
-          `SELECT weight, notes, datetime(recorded_at, '+2 hours') as recorded_at
+          `SELECT weight, notes, datetime(recorded_at, '${tz}') as recorded_at
            FROM weight_history
            WHERE user_id = ?
            ORDER BY recorded_at DESC
@@ -1218,9 +1501,10 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
         }
 
         const limit = args.limit ?? 10;
+        const tz = getKyivOffset();
         const activities = await this.env.DB.prepare(
           `SELECT id, activity_type, duration_minutes, intensity, calories_burned, description, notes,
-                  datetime(created_at, '+2 hours') as created_at
+                  datetime(created_at, '${tz}') as created_at
            FROM activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
         ).bind(userId, limit).all();
 
@@ -1405,10 +1689,11 @@ export class CaloriesMCP extends McpAgent<Env, unknown, unknown> {
           return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Profile not set up. Use set_user_profile first." }) }] };
         }
 
+        const tz = getKyivOffset();
         const today = await this.env.DB.prepare(
           `SELECT COALESCE(SUM(calories), 0) as calories, COALESCE(SUM(proteins), 0) as proteins,
                   COALESCE(SUM(fats), 0) as fats, COALESCE(SUM(carbs), 0) as carbs
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
         ).bind(userId).first();
 
         const calorieGoal = profile.daily_calorie_goal as number;
@@ -1477,6 +1762,56 @@ export default {
     // Health check
     if (url.pathname === "/health") {
       return jsonResponse({ status: "ok" });
+    }
+
+    // Error logs viewer (for debugging)
+    if (url.pathname === "/api/errors") {
+      const limit = parseInt(url.searchParams.get("limit") || "20");
+      const userCode = url.searchParams.get("code");
+
+      let query = `SELECT * FROM error_logs ORDER BY timestamp DESC LIMIT ?`;
+      let params: (string | number)[] = [limit];
+
+      if (userCode) {
+        query = `SELECT * FROM error_logs WHERE user_code = ? ORDER BY timestamp DESC LIMIT ?`;
+        params = [userCode, limit];
+      }
+
+      const errors = await env.DB.prepare(query).bind(...params).all();
+      return jsonResponse({
+        count: errors.results.length,
+        errors: errors.results
+      });
+    }
+
+    // Health check endpoint for monitoring
+    if (url.pathname === "/api/health") {
+      try {
+        // Test DB connection
+        const dbTest = await env.DB.prepare("SELECT 1 as test").first();
+        const errorCount = await env.DB.prepare(
+          "SELECT COUNT(*) as count FROM error_logs WHERE timestamp > datetime('now', '-1 hour')"
+        ).first();
+
+        return jsonResponse({
+          status: "healthy",
+          version: "2.0.0",
+          timestamp: new Date().toISOString(),
+          db_status: dbTest ? "connected" : "disconnected",
+          recent_errors: (errorCount?.count || 0) as number,
+          mcp_endpoints: {
+            sse: "/sse?code=USER_CODE",
+            streamable_http: "/mcp?code=USER_CODE"
+          }
+        });
+      } catch (error) {
+        return jsonResponse({
+          status: "unhealthy",
+          version: "2.0.0",
+          timestamp: new Date().toISOString(),
+          error: String(error)
+        }, 500);
+      }
     }
 
     // Root - info
@@ -1838,16 +2173,17 @@ export default {
 
       // GET /user/{code}/api/today - статистика за сегодня
       if (subPath === '/api/today' && request.method === 'GET') {
+        const tz = getKyivOffset();
         const meals = await env.DB.prepare(
           `SELECT meal_name, calories, proteins, fats, carbs, fiber, meal_type, healthiness_score, created_at
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
            ORDER BY created_at DESC`
         ).bind(userId).all();
 
         const totals = await env.DB.prepare(
           `SELECT SUM(calories) as total_calories, SUM(proteins) as total_proteins,
                   SUM(fats) as total_fats, SUM(carbs) as total_carbs, COUNT(*) as meal_count
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
         ).bind(userId).first();
 
         const profile = await env.DB.prepare(
@@ -2079,17 +2415,18 @@ export default {
 
       // GET /user/{code}/api/weekly - статистика за неделю
       if (subPath === '/api/weekly' && request.method === 'GET') {
+        const tz = getKyivOffset();
         const dailyStats = await env.DB.prepare(
-          `SELECT date(created_at, '+2 hours') as date, COUNT(*) as meal_count, SUM(calories) as total_calories,
+          `SELECT date(created_at, '${tz}') as date, COUNT(*) as meal_count, SUM(calories) as total_calories,
                   SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-           GROUP BY date(created_at, '+2 hours') ORDER BY date DESC`
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+           GROUP BY date(created_at, '${tz}') ORDER BY date DESC`
         ).bind(userId).all();
 
         const weekTotal = await env.DB.prepare(
           `SELECT COUNT(*) as meal_count, SUM(calories) as total_calories, AVG(calories) as avg_daily_calories,
                   SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')`
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')`
         ).bind(userId).first();
 
         return jsonResponse({ period: "Last 7 days", total: weekTotal, daily_breakdown: dailyStats.results });
@@ -2097,11 +2434,12 @@ export default {
 
       // GET /user/{code}/api/monthly - статистика за месяц
       if (subPath === '/api/monthly' && request.method === 'GET') {
+        const tz = getKyivOffset();
         const monthStats = await env.DB.prepare(
           `SELECT COUNT(*) as meal_count, SUM(calories) as total_calories, AVG(calories) as avg_calories_per_meal,
                   SUM(proteins) as total_proteins, SUM(fats) as total_fats, SUM(carbs) as total_carbs,
-                  COUNT(DISTINCT date(created_at, '+2 hours')) as days_tracked
-           FROM meals WHERE user_id = ? AND strftime('%Y-%m', created_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')`
+                  COUNT(DISTINCT date(created_at, '${tz}')) as days_tracked
+           FROM meals WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
         ).bind(userId).first();
 
         return jsonResponse({ period: new Date().toISOString().slice(0, 7), summary: monthStats });
@@ -2131,8 +2469,9 @@ export default {
       // GET /user/{code}/api/weight - история веса
       if (subPath === '/api/weight' && request.method === 'GET') {
         const limit = parseInt(url.searchParams.get('limit') || '30');
+        const tz = getKyivOffset();
         const history = await env.DB.prepare(
-          `SELECT weight, notes, datetime(recorded_at, '+2 hours') as recorded_at FROM weight_history
+          `SELECT weight, notes, datetime(recorded_at, '${tz}') as recorded_at FROM weight_history
            WHERE user_id = ? ORDER BY recorded_at DESC LIMIT ?`
         ).bind(userId, limit).all();
 
@@ -2155,15 +2494,16 @@ export default {
       // GET /user/{code}/api/activity - история активностей
       if (subPath === '/api/activity' && request.method === 'GET') {
         const limit = parseInt(url.searchParams.get('limit') || '10');
+        const tz = getKyivOffset();
         const activities = await env.DB.prepare(
           `SELECT id, activity_type, duration_minutes, intensity, calories_burned, description, notes,
-                  datetime(created_at, '+2 hours') as created_at
+                  datetime(created_at, '${tz}') as created_at
            FROM activities WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`
         ).bind(userId, limit).all();
 
         const totalBurned = await env.DB.prepare(
           `SELECT SUM(calories_burned) as total FROM activities
-           WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+           WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
         ).bind(userId).first();
 
         return jsonResponse({
@@ -2278,10 +2618,11 @@ export default {
           return jsonResponse({ error: "Profile not set up. Use set_user_profile first." }, 404);
         }
 
+        const tz = getKyivOffset();
         const today = await env.DB.prepare(
           `SELECT COALESCE(SUM(calories), 0) as calories, COALESCE(SUM(proteins), 0) as proteins,
                   COALESCE(SUM(fats), 0) as fats, COALESCE(SUM(carbs), 0) as carbs
-           FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
         ).bind(userId).first();
 
         const calorieGoal = profile.daily_calorie_goal as number;
@@ -2459,33 +2800,39 @@ export default {
         return jsonResponse({ error: "User not found. Use /register in Telegram bot." }, 404);
       }
 
-      const summary = await env.DB.prepare(
-        `SELECT
-          COUNT(*) as meal_count,
-          COALESCE(SUM(calories), 0) as total_calories,
-          COALESCE(SUM(proteins), 0) as total_proteins,
-          COALESCE(SUM(fats), 0) as total_fats,
-          COALESCE(SUM(carbs), 0) as total_carbs,
-          COALESCE(SUM(fiber), 0) as total_fiber,
-          COALESCE(SUM(water_ml), 0) as total_water,
-          COALESCE(AVG(healthiness_score), 0) as avg_healthiness
-         FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
-      ).bind(userId).first();
+      try {
+        const tz = getKyivOffset();
+        const summary = await env.DB.prepare(
+          `SELECT
+            COUNT(*) as meal_count,
+            COALESCE(SUM(calories), 0) as total_calories,
+            COALESCE(SUM(proteins), 0) as total_proteins,
+            COALESCE(SUM(fats), 0) as total_fats,
+            COALESCE(SUM(carbs), 0) as total_carbs,
+            COALESCE(SUM(fiber), 0) as total_fiber,
+            COALESCE(SUM(water_ml), 0) as total_water,
+            COALESCE(AVG(healthiness_score), 0) as avg_healthiness
+           FROM meals
+           WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
+        ).bind(userId).first();
 
-      const meals = await env.DB.prepare(
-        `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, healthiness_score,
-                strftime('%H:%M', created_at, '+2 hours') as time
-         FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
-         ORDER BY created_at DESC`
-      ).bind(userId).all();
+        const meals = await env.DB.prepare(
+          `SELECT id, meal_name, calories, proteins, fats, carbs, meal_type, healthiness_score,
+                  strftime('%H:%M', created_at, '${tz}') as time
+           FROM meals
+           WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
+           ORDER BY created_at DESC`
+        ).bind(userId).all();
 
-      return jsonResponse({
-        date: new Date().toISOString().split("T")[0],
-        summary,
-        meals: meals.results,
-      });
+        return jsonResponse({
+          date: new Date().toISOString().split("T")[0],
+          summary,
+          meals: meals.results,
+        });
+      } catch (error) {
+        console.error("Database error in /api/today:", error);
+        return jsonResponse({ error: "Database error", details: String(error) }, 500);
+      }
     }
 
     // GET /api/week?telegram_id=xxx
@@ -2500,40 +2847,61 @@ export default {
         return jsonResponse({ error: "User not found" }, 404);
       }
 
-      const dailyStats = await env.DB.prepare(
-        `SELECT
-          date(created_at, '+2 hours') as date,
-          COUNT(*) as meal_count,
-          SUM(calories) as total_calories,
-          SUM(proteins) as total_proteins,
-          SUM(fats) as total_fats,
-          SUM(carbs) as total_carbs,
-          SUM(water_ml) as total_water,
-          AVG(healthiness_score) as avg_healthiness
-         FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-         GROUP BY date(created_at, '+2 hours')
-         ORDER BY date DESC`
-      ).bind(userId).all();
+      try {
+        const tz = getKyivOffset();
+        const dailyStats = await env.DB.prepare(
+          `SELECT
+            date(created_at, '${tz}') as date,
+            COUNT(*) as meal_count,
+            SUM(calories) as total_calories,
+            SUM(proteins) as total_proteins,
+            SUM(fats) as total_fats,
+            SUM(carbs) as total_carbs,
+            SUM(water_ml) as total_water,
+            AVG(healthiness_score) as avg_healthiness
+           FROM meals
+           WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+           GROUP BY date(created_at, '${tz}')
+           ORDER BY date DESC`
+        ).bind(userId).all();
 
-      const weekTotal = await env.DB.prepare(
-        `SELECT
-          COUNT(*) as meal_count,
-          SUM(calories) as total_calories,
-          SUM(proteins) as total_proteins,
-          SUM(fats) as total_fats,
-          SUM(carbs) as total_carbs,
-          SUM(water_ml) as total_water,
-          AVG(healthiness_score) as avg_healthiness
-         FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')`
-      ).bind(userId).first();
+        const weekTotal = await env.DB.prepare(
+          `SELECT
+            COUNT(*) as meal_count,
+            SUM(calories) as total_calories,
+            SUM(proteins) as total_proteins,
+            SUM(fats) as total_fats,
+            SUM(carbs) as total_carbs,
+            SUM(water_ml) as total_water,
+            AVG(healthiness_score) as avg_healthiness
+           FROM meals
+           WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')`
+        ).bind(userId).first();
 
-      return jsonResponse({
-        period: "Last 7 days",
-        total: weekTotal,
-        daily_breakdown: dailyStats.results,
-      });
+        // Get weekly activities
+        const weekActivities = await env.DB.prepare(
+          `SELECT
+            COUNT(*) as activity_count,
+            SUM(duration_minutes) as total_duration,
+            SUM(calories_burned) as total_burned
+           FROM activities
+           WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')`
+        ).bind(userId).first();
+
+        return jsonResponse({
+          period: "Last 7 days",
+          total: weekTotal,
+          daily_breakdown: dailyStats.results,
+          activities: {
+            count: weekActivities?.activity_count || 0,
+            total_duration: weekActivities?.total_duration || 0,
+            total_burned: weekActivities?.total_burned || 0
+          }
+        });
+      } catch (error) {
+        console.error("Database error in /api/week:", error);
+        return jsonResponse({ error: "Database error", details: String(error) }, 500);
+      }
     }
 
     // === Profile API ===
@@ -2559,12 +2927,13 @@ export default {
       }
 
       // Calculate actual rate from real meal data (last 7 days)
+      const tz = getKyivOffset();
       const avgCalories = await env.DB.prepare(
         `SELECT AVG(daily_total) as avg_cal, COUNT(*) as days_count FROM (
           SELECT SUM(calories) as daily_total
           FROM meals
-          WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-          GROUP BY date(created_at, '+2 hours')
+          WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+          GROUP BY date(created_at, '${tz}')
         )`
       ).bind(userId).first() as { avg_cal: number | null; days_count: number } | null;
 
@@ -2717,8 +3086,9 @@ export default {
         return jsonResponse({ error: "User not found" }, 404);
       }
 
+      const tz = getKyivOffset();
       const history = await env.DB.prepare(
-        `SELECT weight, notes, datetime(recorded_at, '+2 hours') as recorded_at
+        `SELECT weight, notes, datetime(recorded_at, '${tz}') as recorded_at
          FROM weight_history
          WHERE user_id = ?
          ORDER BY recorded_at DESC
@@ -2748,26 +3118,47 @@ export default {
         return jsonResponse({ error: "User not found" }, 404);
       }
 
-      const monthStats = await env.DB.prepare(
-        `SELECT
-          COUNT(*) as meal_count,
-          SUM(calories) as total_calories,
-          AVG(calories) as avg_calories_per_meal,
-          SUM(proteins) as total_proteins,
-          SUM(fats) as total_fats,
-          SUM(carbs) as total_carbs,
-          SUM(fiber) as total_fiber,
-          SUM(water_ml) as total_water,
-          AVG(healthiness_score) as avg_healthiness,
-          COUNT(DISTINCT date(created_at, '+2 hours')) as days_tracked
-         FROM meals
-         WHERE user_id = ? AND strftime('%Y-%m', created_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')`
-      ).bind(userId).first();
+      try {
+        const tz = getKyivOffset();
+        const monthStats = await env.DB.prepare(
+          `SELECT
+            COUNT(*) as meal_count,
+            SUM(calories) as total_calories,
+            AVG(calories) as avg_calories_per_meal,
+            SUM(proteins) as total_proteins,
+            SUM(fats) as total_fats,
+            SUM(carbs) as total_carbs,
+            SUM(fiber) as total_fiber,
+            SUM(water_ml) as total_water,
+            AVG(healthiness_score) as avg_healthiness,
+            COUNT(DISTINCT date(created_at, '${tz}')) as days_tracked
+           FROM meals
+           WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
+        ).bind(userId).first();
 
-      return jsonResponse({
-        period: new Date().toISOString().slice(0, 7),
-        summary: monthStats,
-      });
+        // Get monthly activities
+        const monthActivities = await env.DB.prepare(
+          `SELECT
+            COUNT(*) as activity_count,
+            SUM(duration_minutes) as total_duration,
+            SUM(calories_burned) as total_burned
+           FROM activities
+           WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
+        ).bind(userId).first();
+
+        return jsonResponse({
+          period: new Date().toISOString().slice(0, 7),
+          summary: monthStats,
+          activities: {
+            count: monthActivities?.activity_count || 0,
+            total_duration: monthActivities?.total_duration || 0,
+            total_burned: monthActivities?.total_burned || 0
+          }
+        });
+      } catch (error) {
+        console.error("Database error in /api/month:", error);
+        return jsonResponse({ error: "Database error", details: String(error) }, 500);
+      }
     }
 
     // === Activities API ===
@@ -2784,11 +3175,12 @@ export default {
         return jsonResponse({ error: "User not found" }, 404);
       }
 
+      const tz = getKyivOffset();
       const activities = await env.DB.prepare(
         `SELECT id, activity_type, duration_minutes, intensity, calories_burned, description,
-                strftime('%H:%M', created_at, '+2 hours') as time
+                strftime('%H:%M', created_at, '${tz}') as time
          FROM activities
-         WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
+         WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
          ORDER BY created_at DESC`
       ).bind(userId).all();
 
@@ -2798,7 +3190,7 @@ export default {
           COALESCE(SUM(duration_minutes), 0) as total_duration,
           COALESCE(SUM(calories_burned), 0) as total_burned
          FROM activities
-         WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
+         WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
       ).bind(userId).first();
 
       return jsonResponse({
@@ -2836,11 +3228,12 @@ export default {
       }
 
       // Get today's meals
+      const tz = getKyivOffset();
       const todayData = await env.DB.prepare(
         `SELECT meal_name, calories, proteins, fats, carbs,
-                strftime('%H:%M', created_at, '+2 hours') as time
+                strftime('%H:%M', created_at, '${tz}') as time
          FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
+         WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
          ORDER BY created_at`
       ).bind(userId).all();
 
@@ -2860,7 +3253,7 @@ export default {
       const yesterdayInsight = await env.DB.prepare(
         `SELECT content FROM ai_insights
          WHERE user_id = ? AND insight_type = 'daily'
-         AND insight_date = date('now', '+2 hours', '-1 day')
+         AND insight_date = date('now', '${tz}', '-1 day')
          LIMIT 1`
       ).bind(userId).first();
 
@@ -2923,17 +3316,18 @@ export default {
       }
 
       // Get weekly data by day
+      const tz = getKyivOffset();
       const weekData = await env.DB.prepare(
         `SELECT
-          date(created_at, '+2 hours') as date,
+          date(created_at, '${tz}') as date,
           SUM(calories) as total_calories,
           SUM(proteins) as total_proteins,
           SUM(fats) as total_fats,
           SUM(carbs) as total_carbs,
           COUNT(*) as meal_count
          FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-         GROUP BY date(created_at, '+2 hours')
+         WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+         GROUP BY date(created_at, '${tz}')
          ORDER BY date DESC`
       ).bind(userId).all();
 
@@ -3014,6 +3408,7 @@ export default {
       }
 
       // Get monthly summary
+      const tz = getKyivOffset();
       const monthStats = await env.DB.prepare(
         `SELECT
           COUNT(*) as meal_count,
@@ -3022,9 +3417,9 @@ export default {
           SUM(fats) as total_fats,
           SUM(carbs) as total_carbs,
           AVG(healthiness_score) as avg_healthiness,
-          COUNT(DISTINCT date(created_at, '+2 hours')) as days_tracked
+          COUNT(DISTINCT date(created_at, '${tz}')) as days_tracked
          FROM meals
-         WHERE user_id = ? AND strftime('%Y-%m', created_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')`
+         WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
       ).bind(userId).first();
 
       const daysTracked = (monthStats?.days_tracked as number) || 0;
@@ -3040,6 +3435,20 @@ export default {
       const totalProteins = (monthStats?.total_proteins as number) || 0;
       const avgProtein = Math.round(totalProteins / daysTracked);
       const avgHealth = ((monthStats?.avg_healthiness as number) || 0).toFixed(1);
+
+      // Get first tracking day this month to calculate tracking percentage
+      const firstDay = await env.DB.prepare(
+        `SELECT MIN(date(created_at, '${tz}')) as first_date
+         FROM meals
+         WHERE user_id = ? AND strftime('%Y-%m', created_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')`
+      ).bind(userId).first();
+
+      const firstDate = firstDay?.first_date as string;
+      // Calculate days since first tracking (not since month start)
+      const today = new Date();
+      const firstTrackingDate = firstDate ? new Date(firstDate) : today;
+      const daysSinceStart = Math.ceil((today.getTime() - firstTrackingDate.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+      const trackingPercent = Math.round((daysTracked / daysSinceStart) * 100);
 
       // Get profile
       const profile = await env.DB.prepare(
@@ -3057,9 +3466,9 @@ export default {
 
       // Get weight change for the month
       const weightHistory = await env.DB.prepare(
-        `SELECT weight, date(recorded_at, '+2 hours') as date
+        `SELECT weight, date(recorded_at, '${tz}') as date
          FROM weight_history
-         WHERE user_id = ? AND strftime('%Y-%m', recorded_at, '+2 hours') = strftime('%Y-%m', 'now', '+2 hours')
+         WHERE user_id = ? AND strftime('%Y-%m', recorded_at, '${tz}') = strftime('%Y-%m', 'now', '${tz}')
          ORDER BY recorded_at`
       ).bind(userId).all();
 
@@ -3075,7 +3484,8 @@ export default {
       const monthName = new Date().toLocaleString('ru-RU', { month: 'long', year: 'numeric' });
 
       const userMessage = `ИТОГИ МЕСЯЦА (${monthName}):
-Дней отслеживания: ${daysTracked}
+Дней отслеживания: ${daysTracked} из ${daysSinceStart} возможных (${trackingPercent}% дисциплина)
+Первый день записи: ${firstDate || 'неизвестно'}
 Всего калорий: ${totalCal} (${avgCal}/день)
 Белок: ${Math.round(totalProteins)}г (${avgProtein}г/день)
 Полезность еды: ${avgHealth}/10
@@ -3118,16 +3528,17 @@ ${weightInfo}`;
       }
 
       // Get week's data
+      const tz = getKyivOffset();
       const weekData = await env.DB.prepare(
         `SELECT
-          date(created_at, '+2 hours') as date,
+          date(created_at, '${tz}') as date,
           SUM(calories) as total_calories,
           SUM(proteins) as total_proteins,
           COUNT(*) as meal_count,
           AVG(healthiness_score) as avg_health
          FROM meals
-         WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-7 days')
-         GROUP BY date(created_at, '+2 hours')
+         WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-7 days')
+         GROUP BY date(created_at, '${tz}')
          ORDER BY date`
       ).bind(userId).all();
 
@@ -3188,17 +3599,18 @@ ${weightInfo}`;
       }
 
       // Get detailed daily stats for last 14 days
+      const tz = getKyivOffset();
       const dailyStats = await env.DB.prepare(
         `SELECT
-          date(created_at, '+2 hours') as day,
+          date(created_at, '${tz}') as day,
           SUM(calories) as total_cal,
           SUM(proteins) as total_protein,
           SUM(fats) as total_fat,
           SUM(carbs) as total_carbs,
           COUNT(*) as meal_count
         FROM meals
-        WHERE user_id = ? AND date(created_at, '+2 hours') >= date('now', '+2 hours', '-14 days')
-        GROUP BY date(created_at, '+2 hours')
+        WHERE user_id = ? AND date(created_at, '${tz}') >= date('now', '${tz}', '-14 days')
+        GROUP BY date(created_at, '${tz}')
         ORDER BY day DESC`
       ).bind(userId).all();
 
@@ -3399,51 +3811,58 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
         return jsonResponse({ error: "code parameter required" }, 400);
       }
 
-      const userId = await getUserIdByCode(env.DB, userCode);
-      if (!userId) {
-        return jsonResponse({ error: "User not found" }, 404);
-      }
-
-      const meals = await env.DB.prepare(
-        `SELECT meal_name, calories, proteins, fats, carbs, fiber, meal_type, healthiness_score, created_at
-         FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')
-         ORDER BY created_at DESC`
-      ).bind(userId).all();
-
-      const totals = await env.DB.prepare(
-        `SELECT SUM(calories) as total_calories, SUM(proteins) as total_proteins,
-                SUM(fats) as total_fats, SUM(carbs) as total_carbs, SUM(fiber) as total_fiber,
-                COUNT(*) as meal_count
-         FROM meals WHERE user_id = ? AND date(created_at, '+2 hours') = date('now', '+2 hours')`
-      ).bind(userId).first();
-
-      const profile = await env.DB.prepare(
-        `SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?`
-      ).bind(userId).first();
-
-      const calorieGoal = (profile?.daily_calorie_goal || 2000) as number;
-      const proteinGoal = (profile?.protein_goal || 100) as number;
-      const totalCalories = (totals?.total_calories || 0) as number;
-      const totalProteins = (totals?.total_proteins || 0) as number;
-
-      return jsonResponse({
-        date: new Date().toISOString().split('T')[0],
-        meals: meals.results,
-        totals: {
-          calories: totalCalories,
-          proteins: totalProteins,
-          fats: totals?.total_fats || 0,
-          carbs: totals?.total_carbs || 0,
-          fiber: totals?.total_fiber || 0,
-          meal_count: totals?.meal_count || 0
-        },
-        goals: {
-          calorie_goal: calorieGoal,
-          protein_goal: proteinGoal,
-          calories_remaining: calorieGoal - totalCalories,
-          protein_remaining: proteinGoal - totalProteins
+      try {
+        const userId = await getUserIdByCode(env.DB, userCode);
+        if (!userId) {
+          return jsonResponse({ error: "User not found" }, 404);
         }
-      });
+
+        const tz = getKyivOffset();
+        const meals = await env.DB.prepare(
+          `SELECT meal_name, calories, proteins, fats, carbs, fiber, meal_type, healthiness_score, created_at
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')
+           ORDER BY created_at DESC`
+        ).bind(userId).all();
+
+        const totals = await env.DB.prepare(
+          `SELECT SUM(calories) as total_calories, SUM(proteins) as total_proteins,
+                  SUM(fats) as total_fats, SUM(carbs) as total_carbs, SUM(fiber) as total_fiber,
+                  COUNT(*) as meal_count
+           FROM meals WHERE user_id = ? AND date(created_at, '${tz}') = date('now', '${tz}')`
+        ).bind(userId).first();
+
+        const profile = await env.DB.prepare(
+          `SELECT daily_calorie_goal, protein_goal FROM user_profiles WHERE user_id = ?`
+        ).bind(userId).first();
+
+        const calorieGoal = (profile?.daily_calorie_goal || 2000) as number;
+        const proteinGoal = (profile?.protein_goal || 100) as number;
+        const totalCalories = (totals?.total_calories || 0) as number;
+        const totalProteins = (totals?.total_proteins || 0) as number;
+
+        return jsonResponse({
+          date: new Date().toISOString().split('T')[0],
+          meals: meals.results,
+          totals: {
+            calories: totalCalories,
+            proteins: totalProteins,
+            fats: totals?.total_fats || 0,
+            carbs: totals?.total_carbs || 0,
+            fiber: totals?.total_fiber || 0,
+            meal_count: totals?.meal_count || 0
+          },
+          goals: {
+            calorie_goal: calorieGoal,
+            protein_goal: proteinGoal,
+            calories_remaining: calorieGoal - totalCalories,
+            protein_remaining: proteinGoal - totalProteins
+          }
+        });
+      } catch (error) {
+        console.error("[ChatGPT API] /api/chatgpt/today error:", error);
+        await logError(env.DB, "chatgpt_today", error, userCode, null, { endpoint: "/api/chatgpt/today" });
+        return jsonResponse({ error: "Failed to get today summary", details: String(error) }, 500);
+      }
     }
 
     // GET /api/chatgpt/profile - Get user profile (ChatGPT compatible)
@@ -3453,30 +3872,36 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
         return jsonResponse({ error: "code parameter required" }, 400);
       }
 
-      const userId = await getUserIdByCode(env.DB, userCode);
-      if (!userId) {
-        return jsonResponse({ error: "User not found" }, 404);
+      try {
+        const userId = await getUserIdByCode(env.DB, userCode);
+        if (!userId) {
+          return jsonResponse({ error: "User not found" }, 404);
+        }
+
+        const profile = await env.DB.prepare(
+          `SELECT * FROM user_profiles WHERE user_id = ?`
+        ).bind(userId).first();
+
+        if (!profile) {
+          return jsonResponse({ error: "Profile not set up" }, 404);
+        }
+
+        return jsonResponse({
+          height_cm: profile.height_cm,
+          current_weight: profile.current_weight,
+          target_weight: profile.target_weight,
+          goal_type: profile.goal_type,
+          activity_level: profile.activity_level,
+          bmr: profile.bmr,
+          tdee: profile.tdee,
+          daily_calorie_goal: profile.daily_calorie_goal,
+          protein_goal: profile.protein_goal
+        });
+      } catch (error) {
+        console.error("[ChatGPT API] /api/chatgpt/profile error:", error);
+        await logError(env.DB, "chatgpt_profile", error, userCode, null, { endpoint: "/api/chatgpt/profile" });
+        return jsonResponse({ error: "Failed to get profile", details: String(error) }, 500);
       }
-
-      const profile = await env.DB.prepare(
-        `SELECT * FROM user_profiles WHERE user_id = ?`
-      ).bind(userId).first();
-
-      if (!profile) {
-        return jsonResponse({ error: "Profile not set up" }, 404);
-      }
-
-      return jsonResponse({
-        height_cm: profile.height_cm,
-        current_weight: profile.current_weight,
-        target_weight: profile.target_weight,
-        goal_type: profile.goal_type,
-        activity_level: profile.activity_level,
-        bmr: profile.bmr,
-        tdee: profile.tdee,
-        daily_calorie_goal: profile.daily_calorie_goal,
-        protein_goal: profile.protein_goal
-      });
     }
 
     // GET /api/chatgpt/tools - List available tools for ChatGPT (OpenAPI discovery)

@@ -42,7 +42,7 @@ WEEKLY_REPORT_HOUR = int(os.getenv("WEEKLY_REPORT_HOUR", "20"))
 MONTHLY_REPORT_DAY = int(os.getenv("MONTHLY_REPORT_DAY", "1"))
 MONTHLY_REPORT_HOUR = int(os.getenv("MONTHLY_REPORT_HOUR", "12"))
 
-TZ = os.getenv("TZ", "Europe/Moscow")
+TZ = os.getenv("TZ", "Europe/Kyiv")
 
 # Logging
 logging.basicConfig(level=logging.INFO)

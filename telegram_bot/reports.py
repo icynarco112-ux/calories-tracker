@@ -1,10 +1,16 @@
 import httpx
 import secrets
 import string
+import asyncio
+import logging
 from datetime import datetime
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Cloudflare API URL
 API_BASE_URL = "https://calories-mcp.icynarco112.workers.dev"
+API_TIMEOUT = 20  # seconds
 
 
 def generate_user_code(length: int = 8) -> str:
@@ -20,12 +26,26 @@ async def fetch_api(endpoint: str, method: str = "GET", data: dict = None) -> di
             response = await client.post(
                 f"{API_BASE_URL}{endpoint}",
                 json=data,
-                timeout=10
+                timeout=API_TIMEOUT
             )
         else:
-            response = await client.get(f"{API_BASE_URL}{endpoint}", timeout=10)
+            response = await client.get(f"{API_BASE_URL}{endpoint}", timeout=API_TIMEOUT)
         response.raise_for_status()
         return response.json()
+
+
+async def fetch_api_with_retry(endpoint: str, retries: int = 2) -> dict:
+    """Fetch data from Cloudflare API with automatic retry on timeout."""
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            return await fetch_api(endpoint)
+        except httpx.TimeoutException as e:
+            last_error = e
+            logger.warning(f"API timeout (attempt {attempt + 1}/{retries + 1}): {endpoint}")
+            if attempt < retries:
+                await asyncio.sleep(1)
+    raise last_error
 
 
 async def get_user_by_telegram_id(telegram_id: str) -> dict:
@@ -74,18 +94,26 @@ def format_activity_type(activity_type: str) -> str:
 async def generate_daily_report(telegram_id: str) -> str:
     """Generate daily nutrition report from Cloudflare API."""
     try:
-        data = await fetch_api(f"/api/today?telegram_id={telegram_id}")
+        data = await fetch_api_with_retry(f"/api/today?telegram_id={telegram_id}")
+    except httpx.TimeoutException as e:
+        logger.error(f"Timeout for telegram_id={telegram_id}: {type(e).__name__}")
+        return "📊 *Отчёт за сегодня*\n\nОшибка: сервер не ответил вовремя. Попробуйте позже."
+    except httpx.ConnectError as e:
+        logger.error(f"Connect error for telegram_id={telegram_id}: {e}")
+        return "📊 *Отчёт за сегодня*\n\nОшибка: не удалось подключиться к серверу."
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return "📊 *Отчёт за сегодня*\n\nВы не зарегистрированы. Используйте /register"
-        return f"📊 *Отчёт за сегодня*\n\nОшибка получения данных: {e}"
+        logger.error(f"HTTP error for telegram_id={telegram_id}: {e.response.status_code}")
+        return f"📊 *Отчёт за сегодня*\n\nОшибка сервера ({e.response.status_code})"
     except Exception as e:
-        return f"📊 *Отчёт за сегодня*\n\nОшибка получения данных: {e}"
+        logger.error(f"Unexpected error for telegram_id={telegram_id}: {type(e).__name__}: {e}")
+        return f"📊 *Отчёт за сегодня*\n\nОшибка: {type(e).__name__}: {e}"
 
     # Fetch activities
     activities_data = await get_today_activities(telegram_id)
     activities = activities_data.get("activities", [])
-    total_burned = activities_data.get("total_burned", 0)
+    total_burned = activities_data.get("totals", {}).get("total_burned", 0)
 
     summary = data.get("summary", {})
     meals = data.get("meals", [])
@@ -140,13 +168,21 @@ async def generate_daily_report(telegram_id: str) -> str:
 async def generate_weekly_report(telegram_id: str) -> str:
     """Generate weekly nutrition report from Cloudflare API."""
     try:
-        data = await fetch_api(f"/api/week?telegram_id={telegram_id}")
+        data = await fetch_api_with_retry(f"/api/week?telegram_id={telegram_id}")
+    except httpx.TimeoutException as e:
+        logger.error(f"Timeout for telegram_id={telegram_id} (weekly): {type(e).__name__}")
+        return "📈 *Недельный отчёт*\n\nОшибка: сервер не ответил вовремя. Попробуйте позже."
+    except httpx.ConnectError as e:
+        logger.error(f"Connect error for telegram_id={telegram_id} (weekly): {e}")
+        return "📈 *Недельный отчёт*\n\nОшибка: не удалось подключиться к серверу."
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return "📈 *Недельный отчёт*\n\nВы не зарегистрированы. Используйте /register"
-        return f"📈 *Недельный отчёт*\n\nОшибка получения данных: {e}"
+        logger.error(f"HTTP error for telegram_id={telegram_id} (weekly): {e.response.status_code}")
+        return f"📈 *Недельный отчёт*\n\nОшибка сервера ({e.response.status_code})"
     except Exception as e:
-        return f"📈 *Недельный отчёт*\n\nОшибка получения данных: {e}"
+        logger.error(f"Unexpected error for telegram_id={telegram_id} (weekly): {type(e).__name__}: {e}")
+        return f"📈 *Недельный отчёт*\n\nОшибка: {type(e).__name__}: {e}"
 
     total = data.get("total", {})
     daily_breakdown = data.get("daily_breakdown", [])
@@ -180,6 +216,14 @@ async def generate_weekly_report(telegram_id: str) -> str:
     report += f"⭐ Средняя полезность: {total.get('avg_healthiness', 0) or 0:.1f}/10\n"
     report += f"📝 Всего приёмов пищи: {total.get('meal_count', 0)}\n"
 
+    # Add activities
+    activities = data.get("activities", {})
+    if activities.get("count", 0) > 0:
+        report += f"\n*Активность за неделю:*\n"
+        report += f"🏃 Тренировок: {activities.get('count', 0)}\n"
+        report += f"⏱️ Общее время: {activities.get('total_duration', 0)} мин\n"
+        report += f"🔥 Сожжено: {activities.get('total_burned', 0)} ккал\n"
+
     # Add AI analysis
     try:
         ai_data = await fetch_api(f"/api/analyze/week?telegram_id={telegram_id}")
@@ -194,13 +238,21 @@ async def generate_weekly_report(telegram_id: str) -> str:
 async def generate_monthly_report(telegram_id: str) -> str:
     """Generate monthly nutrition report from Cloudflare API."""
     try:
-        data = await fetch_api(f"/api/month?telegram_id={telegram_id}")
+        data = await fetch_api_with_retry(f"/api/month?telegram_id={telegram_id}")
+    except httpx.TimeoutException as e:
+        logger.error(f"Timeout for telegram_id={telegram_id} (monthly): {type(e).__name__}")
+        return "📅 *Месячный отчёт*\n\nОшибка: сервер не ответил вовремя. Попробуйте позже."
+    except httpx.ConnectError as e:
+        logger.error(f"Connect error for telegram_id={telegram_id} (monthly): {e}")
+        return "📅 *Месячный отчёт*\n\nОшибка: не удалось подключиться к серверу."
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             return "📅 *Месячный отчёт*\n\nВы не зарегистрированы. Используйте /register"
-        return f"📅 *Месячный отчёт*\n\nОшибка получения данных: {e}"
+        logger.error(f"HTTP error for telegram_id={telegram_id} (monthly): {e.response.status_code}")
+        return f"📅 *Месячный отчёт*\n\nОшибка сервера ({e.response.status_code})"
     except Exception as e:
-        return f"📅 *Месячный отчёт*\n\nОшибка получения данных: {e}"
+        logger.error(f"Unexpected error for telegram_id={telegram_id} (monthly): {type(e).__name__}: {e}")
+        return f"📅 *Месячный отчёт*\n\nОшибка: {type(e).__name__}: {e}"
 
     summary = data.get("summary", {})
 
@@ -228,6 +280,14 @@ async def generate_monthly_report(telegram_id: str) -> str:
     avg_water = total_water / days_tracked if total_water else 0
     report += f"💧 Вода: {total_water} мл (≈{avg_water:.0f}/день)\n"
     report += f"⭐ Средняя полезность: {summary.get('avg_healthiness', 0) or 0:.1f}/10\n"
+
+    # Add activities
+    activities = data.get("activities", {})
+    if activities.get("count", 0) > 0:
+        report += f"\n*Активность за месяц:*\n"
+        report += f"🏃 Тренировок: {activities.get('count', 0)}\n"
+        report += f"⏱️ Общее время: {activities.get('total_duration', 0)} мин\n"
+        report += f"🔥 Сожжено: {activities.get('total_burned', 0)} ккал\n"
 
     # Add AI analysis
     try:

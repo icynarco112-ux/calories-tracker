@@ -35,3 +35,7 @@ build/
 
 # Claude plans (local)
 .claude/
+
+# Windows reserved filename artifacts
+nul
+**/nul
