@@ -46,6 +46,45 @@ function sseResponse(endpoint: string): Response {
   });
 }
 
+async function normalizeMcpRequest(request: Request, sessionIdFallback?: string): Promise<Request> {
+  if (request.method !== "POST") {
+    return request;
+  }
+
+  const url = new URL(request.url);
+  const headers = new Headers(request.headers);
+  const bodyText = await request.clone().text();
+
+  let isInitialize = false;
+  try {
+    const parsed = JSON.parse(bodyText);
+    const messages = Array.isArray(parsed) ? parsed : [parsed];
+    isInitialize = messages.some((msg) => msg && typeof msg === "object" && msg.method === "initialize");
+  } catch {
+    // Let the MCP server handle invalid JSON.
+  }
+
+  const accept = headers.get("accept") || "";
+  if (!accept.includes("application/json") || !accept.includes("text/event-stream")) {
+    headers.set("accept", "application/json, text/event-stream");
+  }
+
+  if (isInitialize) {
+    headers.delete("mcp-session-id");
+  } else if (!headers.get("mcp-session-id")) {
+    const sessionId = url.searchParams.get("sessionId") || sessionIdFallback;
+    if (sessionId) {
+      headers.set("mcp-session-id", sessionId);
+    }
+  }
+
+  return new Request(url.toString(), {
+    method: request.method,
+    headers,
+    body: bodyText
+  });
+}
+
 // Helper to get user_id from telegram_id
 async function getUserIdByTelegram(db: D1Database, telegramId: string): Promise<number | null> {
   const user = await db.prepare(
@@ -2701,8 +2740,9 @@ export default {
           url.searchParams.set("sessionId", userCode);
         }
         const modifiedRequest = new Request(url.toString(), request);
+        const normalizedRequest = await normalizeMcpRequest(modifiedRequest, userCode);
         const ctxWithProps = { ...ctx, props: { userCode } };
-        return CaloriesMCPv2.serve("/mcp").fetch(modifiedRequest, env, ctxWithProps);
+        return CaloriesMCPv2.serve("/mcp").fetch(normalizedRequest, env, ctxWithProps);
       }
 
       return jsonResponse({ error: "Unknown endpoint", path: subPath }, 404);
@@ -3970,7 +4010,8 @@ ${weights.length > 0 ? `\nИСТОРИЯ ВЕСА: ${weights.map(w => `${w.weigh
       const userCode = url.searchParams.get("code");
       const ctxWithProps = { ...ctx, props: { userCode } };
       console.log(`[MCP] /mcp request, userCode: ${userCode}`);
-      return CaloriesMCPv2.serve("/mcp").fetch(request, env, ctxWithProps);
+      const normalizedRequest = await normalizeMcpRequest(request, userCode || undefined);
+      return CaloriesMCPv2.serve("/mcp").fetch(normalizedRequest, env, ctxWithProps);
     }
 
     return new Response("Not Found", { status: 404 });
